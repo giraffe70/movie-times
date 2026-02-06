@@ -24,6 +24,18 @@ def install_playwright_browser():
 # 為了避免每次存檔都重跑，可以加個簡單判斷，或是依賴 Playwright 內建的 "已安裝則跳過" 機制
 if not sys.platform.startswith("win"): 
     install_playwright_browser()
+    # 啟動 Xvfb 虛擬顯示器，讓 Playwright 的 new headless 模式可以在無 X server 的雲端環境正常運作
+    if not os.environ.get("DISPLAY"):
+        try:
+            subprocess.Popen(
+                ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            os.environ["DISPLAY"] = ":99"
+            print(">>> Xvfb virtual display started on :99")
+        except Exception as e:
+            print(f">>> Warning: Failed to start Xvfb: {e}")
 
 # --- 1. 系統環境修正 (必須放在最上面) ---
 if sys.platform.startswith("win"):
