@@ -28,11 +28,12 @@ if not sys.platform.startswith("win"):
     if not os.environ.get("DISPLAY"):
         try:
             subprocess.Popen(
-                ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+                ["/usr/bin/Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
             os.environ["DISPLAY"] = ":99"
+            time.sleep(1)  # 等待 Xvfb 就緒
             print(">>> Xvfb virtual display started on :99")
         except Exception as e:
             print(f">>> Warning: Failed to start Xvfb: {e}")
@@ -166,7 +167,8 @@ class VieshowBot:
             try:
                 page.goto(self.url, timeout=60000)
                 selector = "#CinemaNameTWInfoF"
-                page.wait_for_selector(selector)
+                # 增加 timeout 並使用 attached 狀態，更寬容地等待元素出現
+                page.wait_for_selector(selector, timeout=60000, state="attached")
 
                 options = page.locator(f"{selector} option").all()
                 for option in options:
@@ -210,6 +212,16 @@ class VieshowBot:
 
             except Exception as e:
                 print(f"[Error] get_cinemas_and_movies: {e}")
+                # 除錯：截圖並輸出頁面資訊，協助判斷是否被阻擋
+                try:
+                    page.screenshot(path="/tmp/debug_vieshow.png")
+                    print(f"[Debug] 威秀截圖已存至 /tmp/debug_vieshow.png")
+                    print(f"[Debug] Page title: {page.title()}")
+                    print(f"[Debug] Page URL: {page.url}")
+                    content_snippet = page.content()[:1000]
+                    print(f"[Debug] Page content (前 1000 字元): {content_snippet}")
+                except Exception as dbg_e:
+                    print(f"[Debug] 無法取得除錯資訊: {dbg_e}")
             finally:
                 browser.close()
 
@@ -419,6 +431,18 @@ class ShowtimeBot:
 
                 print(f">>> [秀泰] 取得 {len(movies)} 部電影")
 
+                # 除錯：若取得 0 部電影，截圖並輸出頁面資訊
+                if len(movies) == 0:
+                    try:
+                        page.screenshot(path="/tmp/debug_showtime_movies.png")
+                        print(f"[Debug] 秀泰電影頁截圖已存至 /tmp/debug_showtime_movies.png")
+                        print(f"[Debug] Page title: {page.title()}")
+                        print(f"[Debug] Page URL: {page.url}")
+                        content_snippet = page.content()[:1000]
+                        print(f"[Debug] Page content (前 1000 字元): {content_snippet}")
+                    except Exception as dbg_e:
+                        print(f"[Debug] 無法取得除錯資訊: {dbg_e}")
+
                 if movies:
                     first_id = list(movies.values())[0]
                     page.goto(
@@ -444,6 +468,16 @@ class ShowtimeBot:
 
             except Exception as e:
                 print(f"[Error] ShowtimeBot.get_movies_and_cinemas: {e}")
+                # 除錯：截圖並輸出頁面資訊
+                try:
+                    page.screenshot(path="/tmp/debug_showtime_error.png")
+                    print(f"[Debug] 秀泰錯誤截圖已存至 /tmp/debug_showtime_error.png")
+                    print(f"[Debug] Page title: {page.title()}")
+                    print(f"[Debug] Page URL: {page.url}")
+                    content_snippet = page.content()[:1000]
+                    print(f"[Debug] Page content (前 1000 字元): {content_snippet}")
+                except Exception as dbg_e:
+                    print(f"[Debug] 無法取得除錯資訊: {dbg_e}")
             finally:
                 browser.close()
 
