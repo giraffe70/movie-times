@@ -1,0 +1,853 @@
+import streamlit as st
+import asyncio
+import sys
+import re
+import time
+import json
+from datetime import date, datetime, timedelta, timezone
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+
+# --- 自動安裝 Playwright 瀏覽器 (針對雲端環境) ---
+import os
+import subprocess
+
+def install_playwright_browser():
+    try:
+        # 檢查是否已安裝瀏覽器 (簡單檢查目錄是否存在，或直接執行 install，playwright 會自動跳過已安裝的)
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        print(">>> Playwright chromium installed successfully.")
+    except Exception as e:
+        print(f">>> Error installing Playwright browser: {e}")
+
+# 在 Windows 開發環境通常不需要這行(因為你已經手動裝過)，但在雲端環境需要
+# 為了避免每次存檔都重跑，可以加個簡單判斷，或是依賴 Playwright 內建的 "已安裝則跳過" 機制
+if not sys.platform.startswith("win"): 
+    install_playwright_browser()
+
+# --- 1. 系統環境修正 (必須放在最上面) ---
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+# --- 2. 設定頁面 ---
+st.set_page_config(page_title="電影時刻表查詢", page_icon="🎬")
+
+# --- 3. 共用工具函式 ---
+WEEKDAY_NAMES = ["一", "二", "三", "四", "五", "六", "日"]
+TW_TZ = timezone(timedelta(hours=8))
+
+
+def format_date_with_weekday(dt_obj):
+    """將 datetime 格式化為 '2月6日(五)'"""
+    wd = WEEKDAY_NAMES[dt_obj.weekday()]
+    return f"{dt_obj.month}月{dt_obj.day}日({wd})"
+
+
+def parse_date_from_string(date_str):
+    """
+    將爬取到的日期字串（如 '2月6日(五)'、'02月06日(四)'）解析為 date 物件。
+    若解析失敗回傳 None。
+    """
+    match = re.search(r"(\d{1,2})月(\d{1,2})日", date_str)
+    if match:
+        month = int(match.group(1))
+        day = int(match.group(2))
+        today = date.today()
+        year = today.year if month >= today.month else today.year + 1
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+    return None
+
+
+def filter_by_date(times_map, date_mode, date_value):
+    """
+    根據日期篩選條件過濾場次資料。
+
+    Args:
+        times_map: {日期字串: [時間列表]}
+        date_mode: "all" / "single" / "range"
+        date_value: None / date / (start_date, end_date)
+    Returns:
+        過濾後的 {日期字串: [時間列表]}
+    """
+    if date_mode == "all":
+        return times_map
+
+    filtered = {}
+    for date_str, times in times_map.items():
+        parsed = parse_date_from_string(date_str)
+        if parsed is None:
+            filtered[date_str] = times
+            continue
+
+        if date_mode == "single" and date_value:
+            if parsed == date_value:
+                filtered[date_str] = times
+        elif date_mode == "range" and date_value:
+            start_d, end_d = date_value
+            if start_d <= parsed <= end_d:
+                filtered[date_str] = times
+
+    return filtered
+
+
+# ====================================================================
+# 4A. 威秀影城爬蟲機器人
+# ====================================================================
+class VieshowBot:
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    STEALTH_SCRIPT = """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['zh-TW', 'zh', 'en-US', 'en'] });
+    """
+
+    def __init__(self):
+        self.url = "https://www.vscinemas.com.tw/ShowTimes/"
+
+    def _create_stealth_page(self, playwright_instance):
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+        browser = None
+
+        try:
+            browser = playwright_instance.chromium.launch(
+                channel="msedge", headless=True, args=launch_args,
+            )
+            print(">>> [威秀] 使用 Edge headless 模式")
+        except Exception as e:
+            print(f">>> [威秀] Edge 不可用 ({e})，改用隱藏視窗模式")
+
+        if browser is None:
+            browser = playwright_instance.chromium.launch(
+                headless=False,
+                args=launch_args + [
+                    "--window-position=-32000,-32000",
+                    "--window-size=1,1",
+                ],
+            )
+            print(">>> [威秀] 使用隱藏視窗模式")
+
+        page = browser.new_page(
+            user_agent=self.USER_AGENT,
+            viewport={"width": 1920, "height": 1080},
+            locale="zh-TW",
+        )
+        page.add_init_script(self.STEALTH_SCRIPT)
+        return browser, page
+
+    def get_cinemas_and_movies(self):
+        cinema_options = {}
+        movie_list = []
+
+        with sync_playwright() as p:
+            browser, page = self._create_stealth_page(p)
+            try:
+                page.goto(self.url, timeout=60000)
+                selector = "#CinemaNameTWInfoF"
+                page.wait_for_selector(selector)
+
+                options = page.locator(f"{selector} option").all()
+                for option in options:
+                    text = option.text_content()
+                    value = option.get_attribute("value")
+                    if value and text and "請選擇" not in text:
+                        cinema_options[text.strip()] = value
+
+                if cinema_options:
+                    first_value = list(cinema_options.values())[0]
+                    page.select_option(selector, value=first_value)
+                    time.sleep(1)
+                    page.evaluate(f"""
+                        var select = document.querySelector('{selector}');
+                        select.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    """)
+
+                    try:
+                        page.wait_for_function("""
+                            () => {
+                                if (document.querySelector('.MovieName')) return true;
+                                if (document.body.innerText.includes('查無資料')) return true;
+                                return false;
+                            }
+                        """, timeout=15000)
+                        time.sleep(2)
+                    except:
+                        print("[警告] 等待電影清單超時...")
+
+                    content = page.content()
+                    soup = BeautifulSoup(content, "html.parser")
+                    movie_tags = soup.select("strong.MovieName.LangTW")
+                    seen = set()
+                    for tag in movie_tags:
+                        name = tag.get_text(strip=True)
+                        if name and name not in seen:
+                            movie_list.append(name)
+                            seen.add(name)
+
+                print(f">>> [威秀] 取得 {len(cinema_options)} 間影城、{len(movie_list)} 部電影。")
+
+            except Exception as e:
+                print(f"[Error] get_cinemas_and_movies: {e}")
+            finally:
+                browser.close()
+
+        return cinema_options, movie_list
+
+    def get_movie_times_for_cinemas(self, cinema_dict, target_movie):
+        results = {}
+
+        with sync_playwright() as p:
+            print(f">>> [威秀] 啟動爬蟲，查詢《{target_movie}》於 {len(cinema_dict)} 間影城")
+            browser, page = self._create_stealth_page(p)
+
+            try:
+                for cinema_name, cinema_value in cinema_dict.items():
+                    print(f">>> [威秀] 正在查詢：{cinema_name} ...")
+                    page.goto(self.url, timeout=60000)
+
+                    target_select_id = "#CinemaNameTWInfoF"
+                    page.wait_for_selector(target_select_id)
+
+                    page.select_option(target_select_id, value=cinema_value)
+                    time.sleep(1)
+                    page.evaluate(f"""
+                        var select = document.querySelector('{target_select_id}');
+                        select.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    """)
+
+                    try:
+                        page.wait_for_function("""
+                            () => {
+                                if (document.querySelector('.MovieName')) return true;
+                                if (document.body.innerText.includes('查無資料')) return true;
+                                if (document.body.innerText.includes('目前無場次')) return true;
+                                return false;
+                            }
+                        """, timeout=15000)
+                        time.sleep(2)
+                    except:
+                        print(f"[警告] {cinema_name} 等待超時...")
+
+                    content = page.content()
+                    soup = BeautifulSoup(content, "html.parser")
+
+                    if "查無資料" in soup.get_text() or "目前無場次" in soup.get_text():
+                        results[cinema_name] = {}
+                        continue
+
+                    movie_tags = soup.select("strong.MovieName.LangTW")
+                    date_times = {}
+
+                    for movie_tag in movie_tags:
+                        movie_name = movie_tag.get_text(strip=True)
+                        if movie_name != target_movie:
+                            continue
+
+                        parent_div = movie_tag.find_parent("div", class_="col-xs-12")
+                        if not parent_div:
+                            continue
+
+                        date_tags = parent_div.select("strong.RealShowDate.LangTW")
+
+                        for date_tag in date_tags:
+                            date_str = date_tag.get_text(strip=True)
+                            times_list = []
+                            next_elem = date_tag.find_next_sibling()
+
+                            while next_elem:
+                                classes = next_elem.get("class", [])
+
+                                if "SessionTimeInfo" in classes:
+                                    block_text = next_elem.get_text()
+                                    found_times = re.findall(r"\d{1,2}:\d{2}", block_text)
+                                    if found_times:
+                                        times_list.extend(found_times)
+                                    break
+
+                                if "RealShowDate" in classes and "LangTW" in classes:
+                                    break
+
+                                next_elem = next_elem.find_next_sibling()
+
+                            if times_list:
+                                clean_date = date_str.replace("場次", "").strip()
+                                unique_times = sorted(list(set(times_list)))
+                                date_times[clean_date] = unique_times
+
+                    results[cinema_name] = date_times
+                    print(f">>> [威秀] {cinema_name} 完成，找到 {len(date_times)} 天場次。")
+
+            except Exception as e:
+                print(f"[Error] get_movie_times_for_cinemas: {e}")
+            finally:
+                browser.close()
+
+        return results
+
+
+# ====================================================================
+# 4B. 秀泰影城爬蟲機器人
+# ====================================================================
+class ShowtimeBot:
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    STEALTH_SCRIPT = """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['zh-TW', 'zh', 'en-US', 'en'] });
+    """
+
+    PROGRAMS_URL = "https://www.showtimes.com.tw/programs"
+    BOOKING_URL_TEMPLATE = "https://www.showtimes.com.tw/ticketing/forProgram/{}"
+
+    def _create_stealth_page(self, playwright_instance):
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+        browser = None
+
+        try:
+            browser = playwright_instance.chromium.launch(
+                channel="msedge", headless=True, args=launch_args,
+            )
+            print(">>> [秀泰] 使用 Edge headless 模式")
+        except Exception as e:
+            print(f">>> [秀泰] Edge 不可用 ({e})，改用隱藏視窗模式")
+
+        if browser is None:
+            browser = playwright_instance.chromium.launch(
+                headless=False,
+                args=launch_args + [
+                    "--window-position=-32000,-32000",
+                    "--window-size=1,1",
+                ],
+            )
+            print(">>> [秀泰] 使用隱藏視窗模式")
+
+        page = browser.new_page(
+            user_agent=self.USER_AGENT,
+            viewport={"width": 1920, "height": 1080},
+            locale="zh-TW",
+        )
+        page.add_init_script(self.STEALTH_SCRIPT)
+        return browser, page
+
+    def get_movies_and_cinemas(self):
+        movies = {}
+        cinemas = []
+
+        with sync_playwright() as p:
+            browser, page = self._create_stealth_page(p)
+            try:
+                print(">>> [秀泰] 正在讀取電影清單...")
+                page.goto(self.PROGRAMS_URL, timeout=60000)
+                time.sleep(8)
+
+                raw_movies = page.evaluate("""
+                    () => {
+                        const results = [];
+                        const seen = new Set();
+                        const bookingBtns = Array.from(document.querySelectorAll('div')).filter(
+                            el => el.textContent.trim() === '線上訂票' &&
+                                  el.className && typeof el.className === 'string' &&
+                                  el.className.includes('sc-')
+                        );
+
+                        for (const btn of bookingBtns) {
+                            const fiberKey = Object.keys(btn).find(
+                                k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
+                            );
+                            if (!fiberKey) continue;
+
+                            let fiber = btn[fiberKey];
+                            for (let i = 0; i < 25 && fiber; i++) {
+                                if (fiber.memoizedProps && fiber.memoizedProps.program) {
+                                    const prog = fiber.memoizedProps.program;
+                                    const key = prog.id + '_' + prog.name;
+                                    if (!seen.has(key)) {
+                                        seen.add(key);
+                                        results.push({
+                                            id: prog.id,
+                                            name: prog.name || '',
+                                            type: prog.type || '',
+                                            rating: prog.rating || ''
+                                        });
+                                    }
+                                    break;
+                                }
+                                fiber = fiber.return;
+                            }
+                        }
+                        return results;
+                    }
+                """)
+
+                seen_names = set()
+                for movie in raw_movies:
+                    name = movie.get("name", "")
+                    pid = movie.get("id")
+                    if name and pid and name not in seen_names:
+                        movies[name] = pid
+                        seen_names.add(name)
+
+                print(f">>> [秀泰] 取得 {len(movies)} 部電影")
+
+                if movies:
+                    first_id = list(movies.values())[0]
+                    page.goto(
+                        self.BOOKING_URL_TEMPLATE.format(first_id),
+                        timeout=60000,
+                    )
+                    time.sleep(5)
+
+                    raw_cinemas = page.evaluate("""
+                        () => {
+                            return Array.from(document.querySelectorAll('button'))
+                                .filter(btn => {
+                                    const text = btn.textContent.trim();
+                                    return text.includes('秀泰影城') &&
+                                           text.length < 20 &&
+                                           !text.includes('登入');
+                                })
+                                .map(btn => btn.textContent.trim());
+                        }
+                    """)
+                    cinemas = raw_cinemas
+                    print(f">>> [秀泰] 取得 {len(cinemas)} 間影城")
+
+            except Exception as e:
+                print(f"[Error] ShowtimeBot.get_movies_and_cinemas: {e}")
+            finally:
+                browser.close()
+
+        return movies, cinemas
+
+    def get_movie_times(self, program_id, selected_cinemas):
+        results = {}
+        captured_events = []
+        captured_venues = {}
+
+        with sync_playwright() as p:
+            print(f">>> [秀泰] 啟動爬蟲，查詢 programId={program_id}")
+            browser, page = self._create_stealth_page(p)
+
+            try:
+                def on_response(response):
+                    try:
+                        url = response.url
+                        if "events/listForProgram" in url:
+                            data = response.json()
+                            evts = data.get("payload", {}).get("events", [])
+                            captured_events.extend(evts)
+                        elif "/venues/ids/" in url and "/assets/" not in url:
+                            data = response.json()
+                            for v in data.get("payload", {}).get("venues", []):
+                                captured_venues[v["id"]] = {
+                                    "name": v.get("name", ""),
+                                    "room": v.get("room", ""),
+                                }
+                    except Exception:
+                        pass
+
+                page.on("response", on_response)
+
+                page.goto(
+                    self.BOOKING_URL_TEMPLATE.format(program_id),
+                    timeout=60000,
+                )
+                time.sleep(3)
+
+                target_cinema = selected_cinemas[0]
+                cinema_btn = page.locator(f"button:has-text('{target_cinema}')")
+                if cinema_btn.count() > 0:
+                    cinema_btn.first.click()
+                    print(f">>> [秀泰] 已點選 {target_cinema}")
+                    time.sleep(5)
+                else:
+                    print(f">>> [秀泰] 找不到 {target_cinema} 按鈕")
+
+                if not captured_events:
+                    print(">>> [秀泰] 攔截未取得資料，嘗試直接呼叫 API...")
+                    today_str = date.today().isoformat()
+                    events_data = page.evaluate(
+                        """async (args) => {
+                            try {
+                                const resp = await fetch(
+                                    'https://capi.showtimes.com.tw/1/events/listForProgram/'
+                                    + args.pid + '?date=' + args.today + '&forVista=false'
+                                );
+                                return await resp.json();
+                            } catch(e) {
+                                return {error: e.toString()};
+                            }
+                        }""",
+                        {"pid": str(program_id), "today": today_str},
+                    )
+                    if "error" not in events_data:
+                        captured_events = (
+                            events_data.get("payload", {}).get("events", [])
+                        )
+                    else:
+                        print(f">>> [秀泰] API 呼叫失敗: {events_data['error']}")
+
+                if not captured_events:
+                    print(">>> [秀泰] 此電影目前無場次資料")
+                    browser.close()
+                    return {}
+
+                print(f">>> [秀泰] 取得 {len(captured_events)} 筆場次")
+
+                event_venue_ids = set(e["venueId"] for e in captured_events)
+                missing_ids = event_venue_ids - set(captured_venues.keys())
+
+                if missing_ids:
+                    ids_str = ",".join(str(vid) for vid in missing_ids)
+                    print(f">>> [秀泰] 取得 {len(missing_ids)} 間影城的名稱資訊...")
+                    try:
+                        extra = page.evaluate(
+                            """async (idsStr) => {
+                                try {
+                                    const resp = await fetch(
+                                        'https://capi.showtimes.com.tw/1/venues/ids/' + idsStr
+                                    );
+                                    return await resp.json();
+                                } catch(e) {
+                                    return {error: e.toString()};
+                                }
+                            }""",
+                            ids_str,
+                        )
+                        if "error" not in extra:
+                            for v in extra.get("payload", {}).get("venues", []):
+                                captured_venues[v["id"]] = {
+                                    "name": v.get("name", ""),
+                                    "room": v.get("room", ""),
+                                }
+                    except Exception as e:
+                        print(f">>> [秀泰] 取得影城名稱失敗: {e}")
+
+                def match_cinema(api_name, selected_list):
+                    for sel in selected_list:
+                        if sel in api_name or api_name in sel:
+                            return sel
+                    return None
+
+                for event in captured_events:
+                    venue_id = event.get("venueId")
+                    venue_info = captured_venues.get(venue_id, {})
+                    cinema_name = venue_info.get("name", f"未知影城({venue_id})")
+
+                    matched = match_cinema(cinema_name, selected_cinemas)
+                    if matched is None:
+                        continue
+
+                    started_at = event.get("startedAt", "")
+                    if not started_at:
+                        continue
+
+                    dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                    dt_local = dt.astimezone(TW_TZ)
+
+                    date_str = format_date_with_weekday(dt_local)
+                    time_str = dt_local.strftime("%H:%M")
+                    format_info = event.get("meta", {}).get("format", "")
+
+                    display_name = matched
+
+                    if display_name not in results:
+                        results[display_name] = {}
+                    if date_str not in results[display_name]:
+                        results[display_name][date_str] = []
+
+                    display = time_str
+                    if format_info:
+                        display = f"{time_str} [{format_info}]"
+                    results[display_name][date_str].append(display)
+
+                for cinema in results:
+                    sorted_dates = sorted(
+                        results[cinema].keys(),
+                        key=lambda d: parse_date_from_string(d) or date.max,
+                    )
+                    results[cinema] = {
+                        d: sorted(list(set(results[cinema][d])))
+                        for d in sorted_dates
+                    }
+
+                total_dates = sum(len(dm) for dm in results.values())
+                print(
+                    f">>> [秀泰] 查詢完成，"
+                    f"找到 {len(results)} 間影城、共 {total_dates} 天場次。"
+                )
+
+            except Exception as e:
+                print(f"[Error] ShowtimeBot.get_movie_times: {e}")
+            finally:
+                browser.close()
+
+        return results
+
+
+# ====================================================================
+# 5. 快取層
+# ====================================================================
+
+# --- 威秀 ---
+@st.cache_data(show_spinner=False)
+def cached_vieshow_get_cinemas_and_movies():
+    bot = VieshowBot()
+    return bot.get_cinemas_and_movies()
+
+
+@st.cache_data(show_spinner=False)
+def cached_vieshow_get_movie_times(cinema_json, target_movie):
+    cinema_dict = json.loads(cinema_json)
+    bot = VieshowBot()
+    return bot.get_movie_times_for_cinemas(cinema_dict, target_movie)
+
+
+# --- 秀泰 ---
+@st.cache_data(show_spinner=False)
+def cached_showtime_get_movies_and_cinemas():
+    bot = ShowtimeBot()
+    return bot.get_movies_and_cinemas()
+
+
+@st.cache_data(show_spinner=False)
+def cached_showtime_get_movie_times(program_id, selected_cinemas_json):
+    selected_cinemas = json.loads(selected_cinemas_json)
+    bot = ShowtimeBot()
+    return bot.get_movie_times(program_id, selected_cinemas)
+
+
+# ====================================================================
+# 6. 共用 UI 元件：顯示查詢結果
+# ====================================================================
+def show_results(results, selected_movie, date_mode_key, date_filter_value):
+    """顯示查詢結果（威秀 / 秀泰共用）"""
+    if results:
+        filtered_results = {}
+        for cinema_name, times_map in results.items():
+            filtered_results[cinema_name] = filter_by_date(
+                times_map, date_mode_key, date_filter_value
+            )
+
+        has_any_times = any(bool(tm) for tm in filtered_results.values())
+
+        if has_any_times:
+            st.success(f"查詢完成！以下是《{selected_movie}》的場次：")
+
+            for cinema_name, times_map in filtered_results.items():
+                st.markdown(f"### 🏢 {cinema_name}")
+                if not times_map:
+                    st.caption("此影城目前無符合條件的場次")
+                else:
+                    for date_str, times in times_map.items():
+                        times_joined = " / ".join(times)
+                        st.markdown(f"- **{date_str}**：{times_joined}")
+                st.markdown("")
+        else:
+            if date_mode_key != "all":
+                st.warning(
+                    f"⚠️ 所選影城在指定日期內無《{selected_movie}》的場次，"
+                    "請嘗試調整日期條件。"
+                )
+            else:
+                st.warning(f"⚠️ 所選影城目前皆無《{selected_movie}》的場次")
+    else:
+        st.warning("⚠️ 查無資料或解析失敗")
+        st.markdown(
+            """
+**可能原因：**
+1. 所選影城目前沒有此電影的場次。
+2. 網頁載入過慢 (Timeout)。
+3. 官網結構改變。
+
+請查看終端機 (Terminal) 的詳細 Log 進行除錯。
+"""
+        )
+
+
+def date_filter_ui(key_prefix):
+    """共用日期篩選 UI，回傳 (date_mode_key, date_filter_value)"""
+    st.subheader("3️⃣ 選擇日期")
+    date_mode = st.radio(
+        "篩選方式：",
+        ["全部日期", "特定日期", "日期區間"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key=f"{key_prefix}_date_mode",
+    )
+
+    date_filter_value = None
+    if date_mode == "特定日期":
+        date_filter_value = st.date_input(
+            "選擇日期：", value=date.today(), key=f"{key_prefix}_date_single"
+        )
+    elif date_mode == "日期區間":
+        col_start, col_end = st.columns(2)
+        with col_start:
+            start_date = st.date_input(
+                "起始日期：", value=date.today(), key=f"{key_prefix}_date_start"
+            )
+        with col_end:
+            end_date = st.date_input(
+                "結束日期：",
+                value=date.today() + timedelta(days=6),
+                key=f"{key_prefix}_date_end",
+            )
+        date_filter_value = (start_date, end_date)
+
+    date_mode_key = {
+        "全部日期": "all",
+        "特定日期": "single",
+        "日期區間": "range",
+    }[date_mode]
+
+    return date_mode_key, date_filter_value
+
+
+# ====================================================================
+# 7. 前端介面 (UI) — 使用 st.tabs
+# ====================================================================
+st.title("🎬 電影時刻表查詢")
+st.divider()
+
+tab_vieshow, tab_showtime = st.tabs(["🍿 威秀影城", "🎬 秀泰影城"])
+
+# ----------------------------------------------------------------------
+# Tab 1: 威秀影城
+# ----------------------------------------------------------------------
+with tab_vieshow:
+    with st.spinner("正在讀取威秀影城與電影清單..."):
+        vs_cinema_map, vs_movie_list = cached_vieshow_get_cinemas_and_movies()
+
+    if not vs_cinema_map:
+        st.error("無法讀取威秀影城清單，請查看終端機錯誤訊息。")
+    elif not vs_movie_list:
+        st.warning("無法取得威秀電影清單。")
+    else:
+        # Step 1: 選擇電影
+        st.subheader("1️⃣ 選擇電影")
+        vs_selected_movie = st.selectbox(
+            "請選擇電影：", vs_movie_list,
+            label_visibility="collapsed", key="vs_movie"
+        )
+
+        # Step 2: 選擇影城
+        st.subheader("2️⃣ 選擇影城（可多選）")
+        vs_selected_cinemas = st.multiselect(
+            "請選擇影城：",
+            list(vs_cinema_map.keys()),
+            default=[],
+            label_visibility="collapsed",
+            key="vs_cinemas",
+        )
+
+        # Step 3: 日期篩選
+        vs_date_mode_key, vs_date_filter_value = date_filter_ui("vs")
+
+        st.divider()
+
+        # 查詢按鈕
+        if not vs_selected_cinemas:
+            st.button("🔍 查詢時刻表", type="primary", disabled=True, key="vs_btn")
+            st.info("請先選擇至少一間影城，再點擊查詢。")
+        else:
+            if st.button("🔍 查詢時刻表", type="primary", key="vs_btn"):
+                selected_cinema_dict = {
+                    name: vs_cinema_map[name] for name in vs_selected_cinemas
+                }
+                cinema_json = json.dumps(selected_cinema_dict, ensure_ascii=False)
+
+                with st.spinner(
+                    f"正在查詢 {len(vs_selected_cinemas)} 間威秀影城的"
+                    f"《{vs_selected_movie}》場次（每間約 5-10 秒）..."
+                ):
+                    cached_vieshow_get_movie_times.clear()
+                    results = cached_vieshow_get_movie_times(
+                        cinema_json, vs_selected_movie
+                    )
+
+                show_results(
+                    results, vs_selected_movie,
+                    vs_date_mode_key, vs_date_filter_value
+                )
+
+# ----------------------------------------------------------------------
+# Tab 2: 秀泰影城
+# ----------------------------------------------------------------------
+with tab_showtime:
+    with st.spinner("正在讀取秀泰電影與影城清單..."):
+        st_movies_map, st_cinema_list = cached_showtime_get_movies_and_cinemas()
+
+    if not st_movies_map:
+        st.error("無法讀取秀泰電影清單，請查看終端機錯誤訊息。")
+    elif not st_cinema_list:
+        st.warning("無法取得秀泰影城清單。")
+    else:
+        # Step 1: 選擇電影
+        st.subheader("1️⃣ 選擇電影")
+        st_movie_names = list(st_movies_map.keys())
+        st_selected_movie = st.selectbox(
+            "請選擇電影：", st_movie_names,
+            label_visibility="collapsed", key="st_movie"
+        )
+        st_selected_program_id = st_movies_map[st_selected_movie]
+
+        # Step 2: 選擇影城
+        st.subheader("2️⃣ 選擇影城（可多選）")
+        st_selected_cinemas = st.multiselect(
+            "請選擇影城：",
+            st_cinema_list,
+            default=[],
+            label_visibility="collapsed",
+            key="st_cinemas",
+        )
+
+        # Step 3: 日期篩選
+        st_date_mode_key, st_date_filter_value = date_filter_ui("st")
+
+        st.divider()
+
+        # 查詢按鈕
+        if not st_selected_cinemas:
+            st.button("🔍 查詢時刻表", type="primary", disabled=True, key="st_btn")
+            st.info("請先選擇至少一間影城，再點擊查詢。")
+        else:
+            if st.button("🔍 查詢時刻表", type="primary", key="st_btn"):
+                cinemas_json = json.dumps(
+                    st_selected_cinemas, ensure_ascii=False
+                )
+
+                with st.spinner(
+                    f"正在查詢《{st_selected_movie}》的場次..."
+                ):
+                    cached_showtime_get_movie_times.clear()
+                    results = cached_showtime_get_movie_times(
+                        st_selected_program_id, cinemas_json
+                    )
+
+                show_results(
+                    results, st_selected_movie,
+                    st_date_mode_key, st_date_filter_value
+                )
