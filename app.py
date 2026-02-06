@@ -372,60 +372,127 @@ class ShowtimeBot:
     def get_movies_and_cinemas(self):
         movies = {}
         cinemas = []
+        captured_programs = []
 
         with sync_playwright() as p:
             browser, page = self._create_stealth_page(p)
             try:
+                # 攔截 API 回應，直接從 API 取得電影清單（最可靠的方式）
+                def on_response(response):
+                    try:
+                        url = response.url
+                        if "/programs" in url and "capi.showtimes.com.tw" in url:
+                            data = response.json()
+                            progs = data.get("payload", {}).get("programs", [])
+                            captured_programs.extend(progs)
+                    except Exception:
+                        pass
+
+                page.on("response", on_response)
+
                 print(">>> [秀泰] 正在讀取電影清單...")
-                page.goto(self.PROGRAMS_URL, timeout=60000)
-                time.sleep(8)
+                page.goto(self.PROGRAMS_URL, timeout=60000, wait_until="networkidle")
 
-                raw_movies = page.evaluate("""
-                    () => {
-                        const results = [];
-                        const seen = new Set();
-                        const bookingBtns = Array.from(document.querySelectorAll('div')).filter(
-                            el => el.textContent.trim() === '線上訂票' &&
-                                  el.className && typeof el.className === 'string' &&
-                                  el.className.includes('sc-')
-                        );
-
-                        for (const btn of bookingBtns) {
-                            const fiberKey = Object.keys(btn).find(
-                                k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
+                # 等待「線上訂票」按鈕出現（表示 React SPA 已完成渲染）
+                try:
+                    page.wait_for_function("""
+                        () => {
+                            const btns = Array.from(document.querySelectorAll('div')).filter(
+                                el => el.textContent.trim() === '線上訂票'
                             );
-                            if (!fiberKey) continue;
+                            return btns.length > 0;
+                        }
+                    """, timeout=30000)
+                    time.sleep(3)
+                except:
+                    print(">>> [秀泰] 等待頁面渲染超時，嘗試繼續...")
+                    time.sleep(5)
 
-                            let fiber = btn[fiberKey];
-                            for (let i = 0; i < 25 && fiber; i++) {
-                                if (fiber.memoizedProps && fiber.memoizedProps.program) {
-                                    const prog = fiber.memoizedProps.program;
-                                    const key = prog.id + '_' + prog.name;
-                                    if (!seen.has(key)) {
-                                        seen.add(key);
-                                        results.push({
-                                            id: prog.id,
-                                            name: prog.name || '',
-                                            type: prog.type || '',
-                                            rating: prog.rating || ''
-                                        });
+                # 方法一：從攔截的 API 回應取得電影清單
+                if captured_programs:
+                    print(f">>> [秀泰] 從 API 攔截到 {len(captured_programs)} 筆資料")
+                    seen_names = set()
+                    for prog in captured_programs:
+                        name = prog.get("name", "")
+                        pid = prog.get("id")
+                        if name and pid and name not in seen_names:
+                            movies[name] = pid
+                            seen_names.add(name)
+
+                # 方法二：從 React fiber 取得電影清單（備用）
+                if not movies:
+                    print(">>> [秀泰] API 攔截無資料，嘗試從頁面 DOM 擷取...")
+                    raw_movies = page.evaluate("""
+                        () => {
+                            const results = [];
+                            const seen = new Set();
+                            const bookingBtns = Array.from(document.querySelectorAll('div')).filter(
+                                el => el.textContent.trim() === '線上訂票' &&
+                                      el.className && typeof el.className === 'string' &&
+                                      el.className.includes('sc-')
+                            );
+
+                            for (const btn of bookingBtns) {
+                                const fiberKey = Object.keys(btn).find(
+                                    k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
+                                );
+                                if (!fiberKey) continue;
+
+                                let fiber = btn[fiberKey];
+                                for (let i = 0; i < 25 && fiber; i++) {
+                                    if (fiber.memoizedProps && fiber.memoizedProps.program) {
+                                        const prog = fiber.memoizedProps.program;
+                                        const key = prog.id + '_' + prog.name;
+                                        if (!seen.has(key)) {
+                                            seen.add(key);
+                                            results.push({
+                                                id: prog.id,
+                                                name: prog.name || '',
+                                                type: prog.type || '',
+                                                rating: prog.rating || ''
+                                            });
+                                        }
+                                        break;
                                     }
-                                    break;
+                                    fiber = fiber.return;
                                 }
-                                fiber = fiber.return;
+                            }
+                            return results;
+                        }
+                    """)
+
+                    seen_names = set()
+                    for movie in raw_movies:
+                        name = movie.get("name", "")
+                        pid = movie.get("id")
+                        if name and pid and name not in seen_names:
+                            movies[name] = pid
+                            seen_names.add(name)
+
+                # 方法三：直接呼叫 API（最終備用）
+                if not movies:
+                    print(">>> [秀泰] DOM 擷取無資料，嘗試直接呼叫 API...")
+                    api_data = page.evaluate("""
+                        async () => {
+                            try {
+                                const resp = await fetch(
+                                    'https://capi.showtimes.com.tw/1/programs'
+                                );
+                                return await resp.json();
+                            } catch(e) {
+                                return {error: e.toString()};
                             }
                         }
-                        return results;
-                    }
-                """)
-
-                seen_names = set()
-                for movie in raw_movies:
-                    name = movie.get("name", "")
-                    pid = movie.get("id")
-                    if name and pid and name not in seen_names:
-                        movies[name] = pid
-                        seen_names.add(name)
+                    """)
+                    if "error" not in api_data:
+                        progs = api_data.get("payload", {}).get("programs", [])
+                        seen_names = set()
+                        for prog in progs:
+                            name = prog.get("name", "")
+                            pid = prog.get("id")
+                            if name and pid and name not in seen_names:
+                                movies[name] = pid
+                                seen_names.add(name)
 
                 print(f">>> [秀泰] 取得 {len(movies)} 部電影")
 
