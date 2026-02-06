@@ -113,14 +113,49 @@ class VieshowBot:
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
+        "Chrome/145.0.0.0 Safari/537.36"
     )
 
     STEALTH_SCRIPT = """
+        // 1. 隱藏 webdriver 標記
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        // 2. 模擬真實 Chrome 物件
+        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+        // 3. 模擬真實外掛清單
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const arr = [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 2 }
+                ];
+                arr.length = 3;
+                return arr;
+            }
+        });
+        // 4. 語系
         Object.defineProperty(navigator, 'languages', { get: () => ['zh-TW', 'zh', 'en-US', 'en'] });
+        // 5. 硬體資訊
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+        // 6. Permissions API
+        if (navigator.permissions) {
+            const origQuery = navigator.permissions.query;
+            navigator.permissions.query = (params) => (
+                params.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : origQuery(params)
+            );
+        }
+        // 7. WebGL 偽裝
+        try {
+            const getParam = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(p) {
+                if (p === 37445) return 'Intel Inc.';
+                if (p === 37446) return 'Intel Iris OpenGL Engine';
+                return getParam.call(this, p);
+            };
+        } catch(e) {}
     """
 
     def __init__(self):
@@ -131,7 +166,9 @@ class VieshowBot:
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu",  # 新增這行，有助於 Linux 環境穩定
+            "--disable-gpu",
+            "--disable-infobars",
+            "--window-size=1920,1080",
         ]
         browser = None
 
@@ -165,7 +202,8 @@ class VieshowBot:
         with sync_playwright() as p:
             browser, page = self._create_stealth_page(p)
             try:
-                page.goto(self.url, timeout=60000)
+                page.goto(self.url, timeout=60000, wait_until="networkidle")
+                time.sleep(3)  # 額外等待 JS 渲染完成
                 selector = "#CinemaNameTWInfoF"
                 # 增加 timeout 並使用 attached 狀態，更寬容地等待元素出現
                 page.wait_for_selector(selector, timeout=60000, state="attached")
@@ -237,10 +275,11 @@ class VieshowBot:
             try:
                 for cinema_name, cinema_value in cinema_dict.items():
                     print(f">>> [威秀] 正在查詢：{cinema_name} ...")
-                    page.goto(self.url, timeout=60000)
+                    page.goto(self.url, timeout=60000, wait_until="networkidle")
+                    time.sleep(3)
 
                     target_select_id = "#CinemaNameTWInfoF"
-                    page.wait_for_selector(target_select_id)
+                    page.wait_for_selector(target_select_id, timeout=60000, state="attached")
 
                     page.select_option(target_select_id, value=cinema_value)
                     time.sleep(1)
@@ -326,14 +365,49 @@ class ShowtimeBot:
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
+        "Chrome/145.0.0.0 Safari/537.36"
     )
 
     STEALTH_SCRIPT = """
+        // 1. 隱藏 webdriver 標記
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        // 2. 模擬真實 Chrome 物件
+        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+        // 3. 模擬真實外掛清單
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const arr = [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 2 }
+                ];
+                arr.length = 3;
+                return arr;
+            }
+        });
+        // 4. 語系
         Object.defineProperty(navigator, 'languages', { get: () => ['zh-TW', 'zh', 'en-US', 'en'] });
+        // 5. 硬體資訊
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+        // 6. Permissions API
+        if (navigator.permissions) {
+            const origQuery = navigator.permissions.query;
+            navigator.permissions.query = (params) => (
+                params.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : origQuery(params)
+            );
+        }
+        // 7. WebGL 偽裝
+        try {
+            const getParam = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(p) {
+                if (p === 37445) return 'Intel Inc.';
+                if (p === 37446) return 'Intel Iris OpenGL Engine';
+                return getParam.call(this, p);
+            };
+        } catch(e) {}
     """
 
     PROGRAMS_URL = "https://www.showtimes.com.tw/programs"
@@ -344,7 +418,9 @@ class ShowtimeBot:
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu",  # 新增這行，有助於 Linux 環境穩定
+            "--disable-gpu",
+            "--disable-infobars",
+            "--window-size=1920,1080",
         ]
         browser = None
 
@@ -379,8 +455,8 @@ class ShowtimeBot:
             browser, page = self._create_stealth_page(p)
             try:
                 print(">>> [秀泰] 正在讀取電影清單...")
-                page.goto(self.PROGRAMS_URL, timeout=60000)
-                time.sleep(8)
+                page.goto(self.PROGRAMS_URL, timeout=60000, wait_until="networkidle")
+                time.sleep(10)  # SPA 需要更多 JS 渲染時間
 
                 raw_movies = page.evaluate("""
                     () => {
@@ -448,6 +524,7 @@ class ShowtimeBot:
                     page.goto(
                         self.BOOKING_URL_TEMPLATE.format(first_id),
                         timeout=60000,
+                        wait_until="networkidle",
                     )
                     time.sleep(5)
 
@@ -515,8 +592,9 @@ class ShowtimeBot:
                 page.goto(
                     self.BOOKING_URL_TEMPLATE.format(program_id),
                     timeout=60000,
+                    wait_until="networkidle",
                 )
-                time.sleep(3)
+                time.sleep(5)
 
                 target_cinema = selected_cinemas[0]
                 cinema_btn = page.locator(f"button:has-text('{target_cinema}')")
