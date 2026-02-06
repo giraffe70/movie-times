@@ -13,18 +13,11 @@ import os
 import subprocess
 
 def install_playwright_browser():
-    # 優先安裝 MS Edge — 與本地開發環境一致，指紋特徵不會被反爬蟲偵測
-    try:
-        subprocess.run([sys.executable, "-m", "playwright", "install", "msedge"], check=True)
-        print(">>> Playwright msedge installed successfully.")
-    except Exception as e:
-        print(f">>> Error installing msedge: {e}")
-    # 同時安裝 Chromium 作為備用方案
     try:
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
         print(">>> Playwright chromium installed successfully.")
     except Exception as e:
-        print(f">>> Error installing chromium: {e}")
+        print(f">>> Error installing Playwright browser: {e}")
 
 # 在 Windows 開發環境通常不需要這行(因為你已經手動裝過)，但在雲端環境需要
 # 為了避免每次存檔都重跑，可以加個簡單判斷，或是依賴 Playwright 內建的 "已安裝則跳過" 機制
@@ -140,31 +133,26 @@ class VieshowBot:
         ]
         browser = None
 
-        # 1. 優先使用 MS Edge headless（與本地開發環境一致，不易被反爬蟲偵測）
+        # 1. 優先使用 MS Edge headless（Windows 本地環境有 Edge）
         try:
             browser = playwright_instance.chromium.launch(
                 channel="msedge", headless=True, args=launch_args,
             )
             print(">>> [威秀] 使用 Edge headless 模式")
         except Exception as e:
-            print(f">>> [威秀] Edge 不可用 ({e})，嘗試備用方案")
+            print(f">>> [威秀] Edge 不可用 ({e})，改用隱藏視窗模式")
 
-        # 2. 備用：Windows 用隱藏視窗模式，雲端用 Chromium headless
+        # 2. 備用：headless=False 隱藏視窗模式（Windows 靠螢幕外座標，雲端靠 Xvfb）
+        #    headless=False 是完整 GUI 瀏覽器，不會被反爬蟲偵測
         if browser is None:
-            if sys.platform.startswith("win"):
-                browser = playwright_instance.chromium.launch(
-                    headless=False,
-                    args=launch_args + [
-                        "--window-position=-32000,-32000",
-                        "--window-size=1,1",
-                    ],
-                )
-                print(">>> [威秀] 使用隱藏視窗模式")
-            else:
-                browser = playwright_instance.chromium.launch(
-                    headless=True, args=launch_args,
-                )
-                print(">>> [威秀] 使用 Chromium headless 模式 (備用)")
+            browser = playwright_instance.chromium.launch(
+                headless=False,
+                args=launch_args + [
+                    "--window-position=-32000,-32000",
+                    "--window-size=1,1",
+                ],
+            )
+            print(">>> [威秀] 使用隱藏視窗模式")
 
         page = browser.new_page(
             user_agent=self.USER_AGENT,
@@ -352,31 +340,26 @@ class ShowtimeBot:
         ]
         browser = None
 
-        # 1. 優先使用 MS Edge headless（與本地開發環境一致，不易被反爬蟲偵測）
+        # 1. 優先使用 MS Edge headless（Windows 本地環境有 Edge）
         try:
             browser = playwright_instance.chromium.launch(
                 channel="msedge", headless=True, args=launch_args,
             )
             print(">>> [秀泰] 使用 Edge headless 模式")
         except Exception as e:
-            print(f">>> [秀泰] Edge 不可用 ({e})，嘗試備用方案")
+            print(f">>> [秀泰] Edge 不可用 ({e})，改用隱藏視窗模式")
 
-        # 2. 備用：Windows 用隱藏視窗模式，雲端用 Chromium headless
+        # 2. 備用：headless=False 隱藏視窗模式（Windows 靠螢幕外座標，雲端靠 Xvfb）
+        #    headless=False 是完整 GUI 瀏覽器，不會被反爬蟲偵測
         if browser is None:
-            if sys.platform.startswith("win"):
-                browser = playwright_instance.chromium.launch(
-                    headless=False,
-                    args=launch_args + [
-                        "--window-position=-32000,-32000",
-                        "--window-size=1,1",
-                    ],
-                )
-                print(">>> [秀泰] 使用隱藏視窗模式")
-            else:
-                browser = playwright_instance.chromium.launch(
-                    headless=True, args=launch_args,
-                )
-                print(">>> [秀泰] 使用 Chromium headless 模式 (備用)")
+            browser = playwright_instance.chromium.launch(
+                headless=False,
+                args=launch_args + [
+                    "--window-position=-32000,-32000",
+                    "--window-size=1,1",
+                ],
+            )
+            print(">>> [秀泰] 使用隱藏視窗模式")
 
         page = browser.new_page(
             user_agent=self.USER_AGENT,
