@@ -372,56 +372,47 @@ class ShowtimeBot:
     def get_movies_and_cinemas(self):
         movies = {}
         cinemas = []
-        captured_programs = []
 
         with sync_playwright() as p:
             browser, page = self._create_stealth_page(p)
             try:
-                # 攔截 API 回應，直接從 API 取得電影清單（最可靠的方式）
-                def on_response(response):
-                    try:
-                        url = response.url
-                        if "/programs" in url and "capi.showtimes.com.tw" in url:
-                            data = response.json()
-                            progs = data.get("payload", {}).get("programs", [])
-                            captured_programs.extend(progs)
-                    except Exception:
-                        pass
-
-                page.on("response", on_response)
-
                 print(">>> [秀泰] 正在讀取電影清單...")
-                page.goto(self.PROGRAMS_URL, timeout=60000, wait_until="networkidle")
+                # 用 domcontentloaded 而非 networkidle — React SPA 會持續保持網路連線，
+                # networkidle 永遠達不到，會導致 60 秒 timeout
+                page.goto(self.PROGRAMS_URL, timeout=60000, wait_until="domcontentloaded")
+                time.sleep(3)
 
-                # 等待「線上訂票」按鈕出現（表示 React SPA 已完成渲染）
-                try:
-                    page.wait_for_function("""
-                        () => {
-                            const btns = Array.from(document.querySelectorAll('div')).filter(
-                                el => el.textContent.trim() === '線上訂票'
+                # 方法一（最可靠）：直接呼叫 API，不依賴頁面渲染
+                print(">>> [秀泰] 嘗試直接呼叫 API 取得電影清單...")
+                api_data = page.evaluate("""
+                    async () => {
+                        try {
+                            const resp = await fetch(
+                                'https://capi.showtimes.com.tw/1/programs'
                             );
-                            return btns.length > 0;
+                            return await resp.json();
+                        } catch(e) {
+                            return {error: e.toString()};
                         }
-                    """, timeout=30000)
-                    time.sleep(3)
-                except:
-                    print(">>> [秀泰] 等待頁面渲染超時，嘗試繼續...")
-                    time.sleep(5)
-
-                # 方法一：從攔截的 API 回應取得電影清單
-                if captured_programs:
-                    print(f">>> [秀泰] 從 API 攔截到 {len(captured_programs)} 筆資料")
+                    }
+                """)
+                if "error" not in api_data:
+                    progs = api_data.get("payload", {}).get("programs", [])
                     seen_names = set()
-                    for prog in captured_programs:
+                    for prog in progs:
                         name = prog.get("name", "")
                         pid = prog.get("id")
                         if name and pid and name not in seen_names:
                             movies[name] = pid
                             seen_names.add(name)
+                    print(f">>> [秀泰] 從 API 取得 {len(movies)} 部電影")
+                else:
+                    print(f">>> [秀泰] API 呼叫失敗: {api_data.get('error')}")
 
-                # 方法二：從 React fiber 取得電影清單（備用）
+                # 方法二（備用）：等待頁面渲染後從 React fiber 擷取
                 if not movies:
-                    print(">>> [秀泰] API 攔截無資料，嘗試從頁面 DOM 擷取...")
+                    print(">>> [秀泰] 嘗試從頁面 DOM 擷取...")
+                    time.sleep(8)
                     raw_movies = page.evaluate("""
                         () => {
                             const results = [];
@@ -468,39 +459,14 @@ class ShowtimeBot:
                         if name and pid and name not in seen_names:
                             movies[name] = pid
                             seen_names.add(name)
-
-                # 方法三：直接呼叫 API（最終備用）
-                if not movies:
-                    print(">>> [秀泰] DOM 擷取無資料，嘗試直接呼叫 API...")
-                    api_data = page.evaluate("""
-                        async () => {
-                            try {
-                                const resp = await fetch(
-                                    'https://capi.showtimes.com.tw/1/programs'
-                                );
-                                return await resp.json();
-                            } catch(e) {
-                                return {error: e.toString()};
-                            }
-                        }
-                    """)
-                    if "error" not in api_data:
-                        progs = api_data.get("payload", {}).get("programs", [])
-                        seen_names = set()
-                        for prog in progs:
-                            name = prog.get("name", "")
-                            pid = prog.get("id")
-                            if name and pid and name not in seen_names:
-                                movies[name] = pid
-                                seen_names.add(name)
-
-                print(f">>> [秀泰] 取得 {len(movies)} 部電影")
+                    print(f">>> [秀泰] 從 DOM 取得 {len(movies)} 部電影")
 
                 if movies:
                     first_id = list(movies.values())[0]
                     page.goto(
                         self.BOOKING_URL_TEMPLATE.format(first_id),
                         timeout=60000,
+                        wait_until="domcontentloaded",
                     )
                     time.sleep(5)
 
@@ -558,6 +524,7 @@ class ShowtimeBot:
                 page.goto(
                     self.BOOKING_URL_TEMPLATE.format(program_id),
                     timeout=60000,
+                    wait_until="domcontentloaded",
                 )
                 time.sleep(3)
 
