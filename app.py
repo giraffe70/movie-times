@@ -13,12 +13,18 @@ import os
 import subprocess
 
 def install_playwright_browser():
+    # 優先安裝 MS Edge — 與本地開發環境一致，指紋特徵不會被反爬蟲偵測
     try:
-        # 檢查是否已安裝瀏覽器 (簡單檢查目錄是否存在，或直接執行 install，playwright 會自動跳過已安裝的)
+        subprocess.run([sys.executable, "-m", "playwright", "install", "msedge"], check=True)
+        print(">>> Playwright msedge installed successfully.")
+    except Exception as e:
+        print(f">>> Error installing msedge: {e}")
+    # 同時安裝 Chromium 作為備用方案
+    try:
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
         print(">>> Playwright chromium installed successfully.")
     except Exception as e:
-        print(f">>> Error installing Playwright browser: {e}")
+        print(f">>> Error installing chromium: {e}")
 
 # 在 Windows 開發環境通常不需要這行(因為你已經手動裝過)，但在雲端環境需要
 # 為了避免每次存檔都重跑，可以加個簡單判斷，或是依賴 Playwright 內建的 "已安裝則跳過" 機制
@@ -113,49 +119,14 @@ class VieshowBot:
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     )
 
     STEALTH_SCRIPT = """
-        // 1. 隱藏 webdriver 標記
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        // 2. 模擬真實 Chrome 物件
-        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
-        // 3. 模擬真實外掛清單
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => {
-                const arr = [
-                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
-                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
-                    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 2 }
-                ];
-                arr.length = 3;
-                return arr;
-            }
-        });
-        // 4. 語系
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         Object.defineProperty(navigator, 'languages', { get: () => ['zh-TW', 'zh', 'en-US', 'en'] });
-        // 5. 硬體資訊
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-        // 6. Permissions API
-        if (navigator.permissions) {
-            const origQuery = navigator.permissions.query;
-            navigator.permissions.query = (params) => (
-                params.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : origQuery(params)
-            );
-        }
-        // 7. WebGL 偽裝
-        try {
-            const getParam = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(p) {
-                if (p === 37445) return 'Intel Inc.';
-                if (p === 37446) return 'Intel Iris OpenGL Engine';
-                return getParam.call(this, p);
-            };
-        } catch(e) {}
     """
 
     def __init__(self):
@@ -166,26 +137,34 @@ class VieshowBot:
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-infobars",
-            "--window-size=1920,1080",
         ]
         browser = None
 
-        # 1. 優先嘗試使用標準 Chromium (Headless)
-        # 在雲端環境最穩定的選項
+        # 1. 優先使用 MS Edge headless（與本地開發環境一致，不易被反爬蟲偵測）
         try:
             browser = playwright_instance.chromium.launch(
-                headless=True,
-                args=launch_args
+                channel="msedge", headless=True, args=launch_args,
             )
-            print(">>> 使用 Chromium headless 模式")
+            print(">>> [威秀] 使用 Edge headless 模式")
         except Exception as e:
-            print(f">>> Chromium launch failed: {e}")
+            print(f">>> [威秀] Edge 不可用 ({e})，嘗試備用方案")
 
-        # 2. 如果上面失敗 (通常不應該)，再嘗試其他選項，但絕對不能用 headless=False
+        # 2. 備用：Windows 用隱藏視窗模式，雲端用 Chromium headless
         if browser is None:
-             raise RuntimeError("無法啟動瀏覽器，請確認 packages.txt 包含 chromium 且已正確安裝")
+            if sys.platform.startswith("win"):
+                browser = playwright_instance.chromium.launch(
+                    headless=False,
+                    args=launch_args + [
+                        "--window-position=-32000,-32000",
+                        "--window-size=1,1",
+                    ],
+                )
+                print(">>> [威秀] 使用隱藏視窗模式")
+            else:
+                browser = playwright_instance.chromium.launch(
+                    headless=True, args=launch_args,
+                )
+                print(">>> [威秀] 使用 Chromium headless 模式 (備用)")
 
         page = browser.new_page(
             user_agent=self.USER_AGENT,
@@ -202,11 +181,9 @@ class VieshowBot:
         with sync_playwright() as p:
             browser, page = self._create_stealth_page(p)
             try:
-                page.goto(self.url, timeout=60000, wait_until="networkidle")
-                time.sleep(3)  # 額外等待 JS 渲染完成
+                page.goto(self.url, timeout=60000)
                 selector = "#CinemaNameTWInfoF"
-                # 增加 timeout 並使用 attached 狀態，更寬容地等待元素出現
-                page.wait_for_selector(selector, timeout=60000, state="attached")
+                page.wait_for_selector(selector)
 
                 options = page.locator(f"{selector} option").all()
                 for option in options:
@@ -250,16 +227,6 @@ class VieshowBot:
 
             except Exception as e:
                 print(f"[Error] get_cinemas_and_movies: {e}")
-                # 除錯：截圖並輸出頁面資訊，協助判斷是否被阻擋
-                try:
-                    page.screenshot(path="/tmp/debug_vieshow.png")
-                    print(f"[Debug] 威秀截圖已存至 /tmp/debug_vieshow.png")
-                    print(f"[Debug] Page title: {page.title()}")
-                    print(f"[Debug] Page URL: {page.url}")
-                    content_snippet = page.content()[:1000]
-                    print(f"[Debug] Page content (前 1000 字元): {content_snippet}")
-                except Exception as dbg_e:
-                    print(f"[Debug] 無法取得除錯資訊: {dbg_e}")
             finally:
                 browser.close()
 
@@ -275,11 +242,10 @@ class VieshowBot:
             try:
                 for cinema_name, cinema_value in cinema_dict.items():
                     print(f">>> [威秀] 正在查詢：{cinema_name} ...")
-                    page.goto(self.url, timeout=60000, wait_until="networkidle")
-                    time.sleep(3)
+                    page.goto(self.url, timeout=60000)
 
                     target_select_id = "#CinemaNameTWInfoF"
-                    page.wait_for_selector(target_select_id, timeout=60000, state="attached")
+                    page.wait_for_selector(target_select_id)
 
                     page.select_option(target_select_id, value=cinema_value)
                     time.sleep(1)
@@ -365,49 +331,14 @@ class ShowtimeBot:
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     )
 
     STEALTH_SCRIPT = """
-        // 1. 隱藏 webdriver 標記
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        // 2. 模擬真實 Chrome 物件
-        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
-        // 3. 模擬真實外掛清單
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => {
-                const arr = [
-                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
-                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
-                    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 2 }
-                ];
-                arr.length = 3;
-                return arr;
-            }
-        });
-        // 4. 語系
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         Object.defineProperty(navigator, 'languages', { get: () => ['zh-TW', 'zh', 'en-US', 'en'] });
-        // 5. 硬體資訊
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-        // 6. Permissions API
-        if (navigator.permissions) {
-            const origQuery = navigator.permissions.query;
-            navigator.permissions.query = (params) => (
-                params.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : origQuery(params)
-            );
-        }
-        // 7. WebGL 偽裝
-        try {
-            const getParam = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(p) {
-                if (p === 37445) return 'Intel Inc.';
-                if (p === 37446) return 'Intel Iris OpenGL Engine';
-                return getParam.call(this, p);
-            };
-        } catch(e) {}
     """
 
     PROGRAMS_URL = "https://www.showtimes.com.tw/programs"
@@ -418,26 +349,34 @@ class ShowtimeBot:
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-infobars",
-            "--window-size=1920,1080",
         ]
         browser = None
 
-        # 1. 優先嘗試使用標準 Chromium (Headless)
-        # 在雲端環境最穩定的選項
+        # 1. 優先使用 MS Edge headless（與本地開發環境一致，不易被反爬蟲偵測）
         try:
             browser = playwright_instance.chromium.launch(
-                headless=True,
-                args=launch_args
+                channel="msedge", headless=True, args=launch_args,
             )
-            print(">>> 使用 Chromium headless 模式")
+            print(">>> [秀泰] 使用 Edge headless 模式")
         except Exception as e:
-            print(f">>> Chromium launch failed: {e}")
+            print(f">>> [秀泰] Edge 不可用 ({e})，嘗試備用方案")
 
-        # 2. 如果上面失敗 (通常不應該)，再嘗試其他選項，但絕對不能用 headless=False
+        # 2. 備用：Windows 用隱藏視窗模式，雲端用 Chromium headless
         if browser is None:
-             raise RuntimeError("無法啟動瀏覽器，請確認 packages.txt 包含 chromium 且已正確安裝")
+            if sys.platform.startswith("win"):
+                browser = playwright_instance.chromium.launch(
+                    headless=False,
+                    args=launch_args + [
+                        "--window-position=-32000,-32000",
+                        "--window-size=1,1",
+                    ],
+                )
+                print(">>> [秀泰] 使用隱藏視窗模式")
+            else:
+                browser = playwright_instance.chromium.launch(
+                    headless=True, args=launch_args,
+                )
+                print(">>> [秀泰] 使用 Chromium headless 模式 (備用)")
 
         page = browser.new_page(
             user_agent=self.USER_AGENT,
@@ -455,8 +394,8 @@ class ShowtimeBot:
             browser, page = self._create_stealth_page(p)
             try:
                 print(">>> [秀泰] 正在讀取電影清單...")
-                page.goto(self.PROGRAMS_URL, timeout=60000, wait_until="networkidle")
-                time.sleep(10)  # SPA 需要更多 JS 渲染時間
+                page.goto(self.PROGRAMS_URL, timeout=60000)
+                time.sleep(8)
 
                 raw_movies = page.evaluate("""
                     () => {
@@ -507,24 +446,11 @@ class ShowtimeBot:
 
                 print(f">>> [秀泰] 取得 {len(movies)} 部電影")
 
-                # 除錯：若取得 0 部電影，截圖並輸出頁面資訊
-                if len(movies) == 0:
-                    try:
-                        page.screenshot(path="/tmp/debug_showtime_movies.png")
-                        print(f"[Debug] 秀泰電影頁截圖已存至 /tmp/debug_showtime_movies.png")
-                        print(f"[Debug] Page title: {page.title()}")
-                        print(f"[Debug] Page URL: {page.url}")
-                        content_snippet = page.content()[:1000]
-                        print(f"[Debug] Page content (前 1000 字元): {content_snippet}")
-                    except Exception as dbg_e:
-                        print(f"[Debug] 無法取得除錯資訊: {dbg_e}")
-
                 if movies:
                     first_id = list(movies.values())[0]
                     page.goto(
                         self.BOOKING_URL_TEMPLATE.format(first_id),
                         timeout=60000,
-                        wait_until="networkidle",
                     )
                     time.sleep(5)
 
@@ -545,16 +471,6 @@ class ShowtimeBot:
 
             except Exception as e:
                 print(f"[Error] ShowtimeBot.get_movies_and_cinemas: {e}")
-                # 除錯：截圖並輸出頁面資訊
-                try:
-                    page.screenshot(path="/tmp/debug_showtime_error.png")
-                    print(f"[Debug] 秀泰錯誤截圖已存至 /tmp/debug_showtime_error.png")
-                    print(f"[Debug] Page title: {page.title()}")
-                    print(f"[Debug] Page URL: {page.url}")
-                    content_snippet = page.content()[:1000]
-                    print(f"[Debug] Page content (前 1000 字元): {content_snippet}")
-                except Exception as dbg_e:
-                    print(f"[Debug] 無法取得除錯資訊: {dbg_e}")
             finally:
                 browser.close()
 
@@ -592,9 +508,8 @@ class ShowtimeBot:
                 page.goto(
                     self.BOOKING_URL_TEMPLATE.format(program_id),
                     timeout=60000,
-                    wait_until="networkidle",
                 )
-                time.sleep(5)
+                time.sleep(3)
 
                 target_cinema = selected_cinemas[0]
                 cinema_btn = page.locator(f"button:has-text('{target_cinema}')")
