@@ -118,26 +118,24 @@ class VieshowBot:
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
+            "--disable-gpu",  # 新增這行，有助於 Linux 環境穩定
         ]
         browser = None
 
+        # 1. 優先嘗試使用標準 Chromium (Headless)
+        # 在雲端環境最穩定的選項
         try:
             browser = playwright_instance.chromium.launch(
-                channel="msedge", headless=True, args=launch_args,
+                headless=True,
+                args=launch_args
             )
-            print(">>> [威秀] 使用 Edge headless 模式")
+            print(">>> 使用 Chromium headless 模式")
         except Exception as e:
-            print(f">>> [威秀] Edge 不可用 ({e})，改用隱藏視窗模式")
+            print(f">>> Chromium launch failed: {e}")
 
+        # 2. 如果上面失敗 (通常不應該)，再嘗試其他選項，但絕對不能用 headless=False
         if browser is None:
-            browser = playwright_instance.chromium.launch(
-                headless=False,
-                args=launch_args + [
-                    "--window-position=-32000,-32000",
-                    "--window-size=1,1",
-                ],
-            )
-            print(">>> [威秀] 使用隱藏視窗模式")
+             raise RuntimeError("無法啟動瀏覽器，請確認 packages.txt 包含 chromium 且已正確安裝")
 
         page = browser.new_page(
             user_agent=self.USER_AGENT,
@@ -322,26 +320,24 @@ class ShowtimeBot:
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
+            "--disable-gpu",  # 新增這行，有助於 Linux 環境穩定
         ]
         browser = None
 
+        # 1. 優先嘗試使用標準 Chromium (Headless)
+        # 在雲端環境最穩定的選項
         try:
             browser = playwright_instance.chromium.launch(
-                channel="msedge", headless=True, args=launch_args,
+                headless=True,
+                args=launch_args
             )
-            print(">>> [秀泰] 使用 Edge headless 模式")
+            print(">>> 使用 Chromium headless 模式")
         except Exception as e:
-            print(f">>> [秀泰] Edge 不可用 ({e})，改用隱藏視窗模式")
+            print(f">>> Chromium launch failed: {e}")
 
+        # 2. 如果上面失敗 (通常不應該)，再嘗試其他選項，但絕對不能用 headless=False
         if browser is None:
-            browser = playwright_instance.chromium.launch(
-                headless=False,
-                args=launch_args + [
-                    "--window-position=-32000,-32000",
-                    "--window-size=1,1",
-                ],
-            )
-            print(">>> [秀泰] 使用隱藏視窗模式")
+             raise RuntimeError("無法啟動瀏覽器，請確認 packages.txt 包含 chromium 且已正確安裝")
 
         page = browser.new_page(
             user_agent=self.USER_AGENT,
