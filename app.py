@@ -38,6 +38,8 @@ def show_results(
     selected_movie: str,
     date_mode_key: str,
     date_filter_value: date | tuple[date, date] | None,
+    booking_url: str = "",
+    booking_label: str = "前往官方網站訂票",
 ) -> None:
     """顯示查詢結果（威秀 / 秀泰共用）。"""
     if results:
@@ -61,6 +63,13 @@ def show_results(
                         times_joined = " / ".join(times)
                         st.markdown(f"- **{date_str}**：{times_joined}")
                 st.markdown("")
+
+            # 訂票連結
+            if booking_url:
+                st.markdown("---")
+                st.markdown(
+                    f"🎟️ **[{booking_label}]({booking_url})**"
+                )
         else:
             if date_mode_key != "all":
                 st.warning(
@@ -149,7 +158,13 @@ tab_vieshow, tab_showtime = st.tabs(["🍿 威秀影城", "🎬 秀泰影城"])
 # ----------------------------------------------------------------------
 # Tab 1: 威秀影城（延遲載入）
 # ----------------------------------------------------------------------
+VIESHOW_OFFICIAL_URL = "https://www.vscinemas.com.tw/"
+SHOWTIME_OFFICIAL_URL = "https://www.showtimes.com.tw/programs"
+
 with tab_vieshow:
+    st.markdown(
+        f"🌐 官方網站：[威秀影城]({VIESHOW_OFFICIAL_URL})"
+    )
     # 檢查 session_state 是否已有載入的資料
     if st.session_state.get("vs_data") is None:
         if st.button(
@@ -227,6 +242,8 @@ with tab_vieshow:
                         vs_selected_movie,
                         vs_date_mode_key,
                         vs_date_filter_value,
+                        booking_url=VIESHOW_OFFICIAL_URL,
+                        booking_label="前往威秀影城官網訂票",
                     )
 
         # 重新載入按鈕
@@ -241,6 +258,9 @@ with tab_vieshow:
 # Tab 2: 秀泰影城（延遲載入）
 # ----------------------------------------------------------------------
 with tab_showtime:
+    st.markdown(
+        f"🌐 官方網站：[秀泰影城]({SHOWTIME_OFFICIAL_URL})"
+    )
     # 檢查 session_state 是否已有載入的資料
     if st.session_state.get("st_data") is None:
         if st.button(
@@ -315,6 +335,8 @@ with tab_showtime:
                         st_selected_movie,
                         st_date_mode_key,
                         st_date_filter_value,
+                        booking_url=SHOWTIME_OFFICIAL_URL,
+                        booking_label="前往秀泰影城官網訂票",
                     )
 
         # 重新載入按鈕
