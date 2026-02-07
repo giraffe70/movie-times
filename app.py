@@ -380,39 +380,29 @@ class ShowtimeBot:
                 # 用 domcontentloaded 而非 networkidle — React SPA 會持續保持網路連線，
                 # networkidle 永遠達不到，會導致 60 秒 timeout
                 page.goto(self.PROGRAMS_URL, timeout=60000, wait_until="domcontentloaded")
-                time.sleep(3)
 
-                # 方法一（最可靠）：直接呼叫 API，不依賴頁面渲染
-                print(">>> [秀泰] 嘗試直接呼叫 API 取得電影清單...")
-                api_data = page.evaluate("""
-                    async () => {
-                        try {
-                            const resp = await fetch(
-                                'https://capi.showtimes.com.tw/1/programs'
-                            );
-                            return await resp.json();
-                        } catch(e) {
-                            return {error: e.toString()};
+                # 等待 SPA 渲染完成：偵測「線上訂票」按鈕出現
+                print(">>> [秀泰] 等待頁面渲染...")
+                try:
+                    page.wait_for_function("""
+                        () => {
+                            const btns = document.querySelectorAll('div');
+                            for (const el of btns) {
+                                if (el.textContent.trim() === '線上訂票') return true;
+                            }
+                            return false;
                         }
-                    }
-                """)
-                if "error" not in api_data:
-                    progs = api_data.get("payload", {}).get("programs", [])
-                    seen_names = set()
-                    for prog in progs:
-                        name = prog.get("name", "")
-                        pid = prog.get("id")
-                        if name and pid and name not in seen_names:
-                            movies[name] = pid
-                            seen_names.add(name)
-                    print(f">>> [秀泰] 從 API 取得 {len(movies)} 部電影")
-                else:
-                    print(f">>> [秀泰] API 呼叫失敗: {api_data.get('error')}")
+                    """, timeout=20000)
+                    time.sleep(2)  # 額外等待確保所有電影卡片渲染完成
+                    print(">>> [秀泰] 頁面渲染完成")
+                except Exception:
+                    print(">>> [秀泰] 等待渲染超時，仍嘗試擷取...")
+                    time.sleep(5)
 
-                # 方法二（備用）：等待頁面渲染後從 React fiber 擷取
-                if not movies:
-                    print(">>> [秀泰] 嘗試從頁面 DOM 擷取...")
-                    time.sleep(8)
+                # 方法一（主要）：從 React fiber 擷取電影資料
+                # （秀泰官網現為 SSR + React SPA，capi API 已不再回傳電影清單）
+                print(">>> [秀泰] 從頁面 DOM / React fiber 擷取電影...")
+                try:
                     raw_movies = page.evaluate("""
                         () => {
                             const results = [];
@@ -460,7 +450,47 @@ class ShowtimeBot:
                             movies[name] = pid
                             seen_names.add(name)
                     print(f">>> [秀泰] 從 DOM 取得 {len(movies)} 部電影")
+                except Exception as e:
+                    print(f">>> [秀泰] DOM 擷取失敗: {e}")
 
+                # 方法二（備用）：直接呼叫 API（加上 timeout 保護）
+                if not movies:
+                    print(">>> [秀泰] DOM 方法未取得資料，嘗試 API 備用方案...")
+                    try:
+                        api_data = page.evaluate("""
+                            async () => {
+                                const controller = new AbortController();
+                                const timeoutId = setTimeout(() => controller.abort(), 10000);
+                                try {
+                                    const resp = await fetch(
+                                        'https://capi.showtimes.com.tw/1/programs',
+                                        { signal: controller.signal }
+                                    );
+                                    clearTimeout(timeoutId);
+                                    return await resp.json();
+                                } catch(e) {
+                                    clearTimeout(timeoutId);
+                                    return {error: e.toString()};
+                                }
+                            }
+                        """)
+                        if isinstance(api_data, dict) and "error" not in api_data:
+                            progs = api_data.get("payload", {}).get("programs", [])
+                            seen_names = set()
+                            for prog in progs:
+                                name = prog.get("name", "")
+                                pid = prog.get("id")
+                                if name and pid and name not in seen_names:
+                                    movies[name] = pid
+                                    seen_names.add(name)
+                            print(f">>> [秀泰] 從 API 取得 {len(movies)} 部電影")
+                        else:
+                            err = api_data.get("error", "unknown") if isinstance(api_data, dict) else str(api_data)
+                            print(f">>> [秀泰] API 呼叫失敗: {err}")
+                    except Exception as e:
+                        print(f">>> [秀泰] API 備用方案失敗: {e}")
+
+                # 取得影城列表
                 if movies:
                     first_id = list(movies.values())[0]
                     page.goto(
@@ -468,7 +498,16 @@ class ShowtimeBot:
                         timeout=60000,
                         wait_until="domcontentloaded",
                     )
-                    time.sleep(5)
+                    try:
+                        page.wait_for_function("""
+                            () => {
+                                const btns = Array.from(document.querySelectorAll('button'));
+                                return btns.some(b => b.textContent.includes('秀泰影城'));
+                            }
+                        """, timeout=15000)
+                        time.sleep(1)
+                    except Exception:
+                        time.sleep(5)
 
                     raw_cinemas = page.evaluate("""
                         () => {
@@ -678,7 +717,7 @@ def cached_vieshow_get_movie_times(cinema_json, target_movie):
 
 
 # --- 秀泰 ---
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)  # 快取 1 小時，避免快取失敗結果
 def cached_showtime_get_movies_and_cinemas():
     bot = ShowtimeBot()
     return bot.get_movies_and_cinemas()
