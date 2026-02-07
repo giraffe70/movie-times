@@ -44,7 +44,7 @@ if not IS_CLOUD:
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # --- 2. 設定頁面 ---
-st.set_page_config(page_title="電影時刻表查詢", page_icon="🎬")
+st.set_page_config(page_title="電影時刻查詢", page_icon="🎬")
 
 # --- 3. 共用工具函式 ---
 WEEKDAY_NAMES = ["一", "二", "三", "四", "五", "六", "日"]
@@ -1023,7 +1023,7 @@ def date_filter_ui(key_prefix):
 # ====================================================================
 # 7. 前端介面 (UI) — 使用 st.tabs
 # ====================================================================
-st.title("🎬 電影時刻表查詢")
+st.title("🎬 電影時刻查詢")
 st.divider()
 
 tab_vieshow, tab_showtime = st.tabs(["🍿 威秀影城", "🎬 秀泰影城"])
@@ -1075,7 +1075,7 @@ with tab_vieshow:
 
                 with st.spinner(
                     f"正在查詢 {len(vs_selected_cinemas)} 間威秀影城的"
-                    f"《{vs_selected_movie}》場次（每間約 5-10 秒）..."
+                    f"《{vs_selected_movie}》場次..."
                 ):
                     cached_vieshow_get_movie_times.clear()
                     results = cached_vieshow_get_movie_times(
