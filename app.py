@@ -4,6 +4,8 @@ import sys
 import re
 import time
 import json
+import urllib.request
+import urllib.error
 from datetime import date, datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -12,6 +14,8 @@ from playwright.sync_api import sync_playwright
 import os
 import subprocess
 
+IS_CLOUD = not sys.platform.startswith("win")
+
 def install_playwright_browser():
     try:
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
@@ -19,11 +23,9 @@ def install_playwright_browser():
     except Exception as e:
         print(f">>> Error installing Playwright browser: {e}")
 
-# 在 Windows 開發環境通常不需要這行(因為你已經手動裝過)，但在雲端環境需要
-# 為了避免每次存檔都重跑，可以加個簡單判斷，或是依賴 Playwright 內建的 "已安裝則跳過" 機制
-if not sys.platform.startswith("win"): 
+if IS_CLOUD:
     install_playwright_browser()
-    # 啟動 Xvfb 虛擬顯示器，讓 Playwright 的 new headless 模式可以在無 X server 的雲端環境正常運作
+    # 啟動 Xvfb 虛擬顯示器（備用，供 headless=False 模式使用）
     if not os.environ.get("DISPLAY"):
         try:
             subprocess.Popen(
@@ -32,13 +34,13 @@ if not sys.platform.startswith("win"):
                 stderr=subprocess.DEVNULL
             )
             os.environ["DISPLAY"] = ":99"
-            time.sleep(1)  # 等待 Xvfb 就緒
+            time.sleep(1)
             print(">>> Xvfb virtual display started on :99")
         except Exception as e:
             print(f">>> Warning: Failed to start Xvfb: {e}")
 
 # --- 1. 系統環境修正 (必須放在最上面) ---
-if sys.platform.startswith("win"):
+if not IS_CLOUD:
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # --- 2. 設定頁面 ---
@@ -315,6 +317,83 @@ class VieshowBot:
 # ====================================================================
 # 4B. 秀泰影城爬蟲機器人
 # ====================================================================
+
+def _fetch_showtime_programs_via_http():
+    """
+    純 Python HTTP 備援：不透過瀏覽器，直接用 urllib 向秀泰 API 取得電影清單。
+    在 Streamlit Cloud 上若瀏覽器被 Cloudflare 擋住，此方法可繞過。
+    """
+    url = "https://capi.showtimes.com.tw/1/programs"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": "https://www.showtimes.com.tw",
+        "Referer": "https://www.showtimes.com.tw/programs",
+    }
+    movies = {}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            progs = data.get("payload", {}).get("programs", [])
+            seen = set()
+            for prog in progs:
+                name = prog.get("name", "")
+                pid = prog.get("id")
+                if name and pid and name not in seen:
+                    movies[name] = pid
+                    seen.add(name)
+            print(f">>> [秀泰] HTTP API 取得 {len(movies)} 部電影")
+    except Exception as e:
+        print(f">>> [秀泰] HTTP API 失敗: {e}")
+    return movies
+
+
+def _fetch_showtime_cinemas_via_http(program_id):
+    """純 Python HTTP 備援：取得影城列表"""
+    today_str = date.today().isoformat()
+    url = (
+        f"https://capi.showtimes.com.tw/1/events/listForProgram/"
+        f"{program_id}?date={today_str}&forVista=false"
+    )
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.showtimes.com.tw",
+        "Referer": "https://www.showtimes.com.tw/",
+    }
+    cinemas = []
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            events = data.get("payload", {}).get("events", [])
+            venue_ids = list(set(str(e.get("venueId", "")) for e in events if e.get("venueId")))
+            if venue_ids:
+                ids_str = ",".join(venue_ids)
+                venue_url = f"https://capi.showtimes.com.tw/1/venues/ids/{ids_str}"
+                req2 = urllib.request.Request(venue_url, headers=headers)
+                with urllib.request.urlopen(req2, timeout=15) as resp2:
+                    vdata = json.loads(resp2.read().decode("utf-8"))
+                    for v in vdata.get("payload", {}).get("venues", []):
+                        name = v.get("name", "")
+                        if "秀泰影城" in name and name not in cinemas:
+                            cinemas.append(name)
+            print(f">>> [秀泰] HTTP API 取得 {len(cinemas)} 間影城")
+    except Exception as e:
+        print(f">>> [秀泰] HTTP 取得影城失敗: {e}")
+    return cinemas
+
+
 class ShowtimeBot:
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -322,11 +401,22 @@ class ShowtimeBot:
         "Chrome/131.0.0.0 Safari/537.36"
     )
 
+    # 加強版反偵測腳本（針對 Cloudflare Turnstile）
     STEALTH_SCRIPT = """
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {} };
+        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         Object.defineProperty(navigator, 'languages', { get: () => ['zh-TW', 'zh', 'en-US', 'en'] });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+        if (navigator.permissions && navigator.permissions.query) {
+            const origQuery = navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = (params) =>
+                params.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : origQuery(params);
+        }
     """
 
     PROGRAMS_URL = "https://www.showtimes.com.tw/programs"
@@ -340,17 +430,29 @@ class ShowtimeBot:
         ]
         browser = None
 
-        # 1. 優先使用 MS Edge headless（Windows 本地環境有 Edge）
-        try:
-            browser = playwright_instance.chromium.launch(
-                channel="msedge", headless=True, args=launch_args,
-            )
-            print(">>> [秀泰] 使用 Edge headless 模式")
-        except Exception as e:
-            print(f">>> [秀泰] Edge 不可用 ({e})，改用隱藏視窗模式")
+        # 1. Windows: 優先使用 Edge headless
+        if not IS_CLOUD:
+            try:
+                browser = playwright_instance.chromium.launch(
+                    channel="msedge", headless=True, args=launch_args,
+                )
+                print(">>> [秀泰] 使用 Edge headless 模式")
+            except Exception as e:
+                print(f">>> [秀泰] Edge 不可用 ({e})")
 
-        # 2. 備用：headless=False 隱藏視窗模式（Windows 靠螢幕外座標，雲端靠 Xvfb）
-        #    headless=False 是完整 GUI 瀏覽器，不會被反爬蟲偵測
+        # 2. 雲端: 使用 Chromium headless（新版 headless 與完整瀏覽器同核心，
+        #    比 headless=False + Xvfb 更穩定、更省資源、反偵測能力也不差）
+        if browser is None and IS_CLOUD:
+            try:
+                browser = playwright_instance.chromium.launch(
+                    headless=True,
+                    args=launch_args,
+                )
+                print(">>> [秀泰] 使用 Chromium headless 模式 (雲端)")
+            except Exception as e:
+                print(f">>> [秀泰] Chromium headless 失敗: {e}")
+
+        # 3. 備用：headless=False 隱藏視窗模式
         if browser is None:
             browser = playwright_instance.chromium.launch(
                 headless=False,
@@ -359,7 +461,7 @@ class ShowtimeBot:
                     "--window-size=1,1",
                 ],
             )
-            print(">>> [秀泰] 使用隱藏視窗模式")
+            print(">>> [秀泰] 使用隱藏視窗模式 (fallback)")
 
         page = browser.new_page(
             user_agent=self.USER_AGENT,
@@ -369,145 +471,101 @@ class ShowtimeBot:
         page.add_init_script(self.STEALTH_SCRIPT)
         return browser, page
 
+    def _goto_safe(self, page, url, timeout=60000):
+        """
+        安全導航：先嘗試預設 wait_until="load"，
+        若逾時（SPA 不會完成 load），改用 "domcontentloaded"。
+        """
+        try:
+            page.goto(url, timeout=timeout)
+            return
+        except Exception as e:
+            if "timeout" in str(e).lower() or "Timeout" in str(type(e).__name__):
+                print(f">>> [秀泰] page.goto load 逾時，改用 domcontentloaded...")
+                page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            else:
+                raise
+
     def get_movies_and_cinemas(self):
         movies = {}
         cinemas = []
 
+        # ============================================================
+        # 方法一：瀏覽器渲染 + React fiber 擷取（本機版相同邏輯）
+        # ============================================================
         with sync_playwright() as p:
             browser, page = self._create_stealth_page(p)
             try:
                 print(">>> [秀泰] 正在讀取電影清單...")
-                # 用 domcontentloaded 而非 networkidle — React SPA 會持續保持網路連線，
-                # networkidle 永遠達不到，會導致 60 秒 timeout
-                page.goto(self.PROGRAMS_URL, timeout=60000, wait_until="domcontentloaded")
+                self._goto_safe(page, self.PROGRAMS_URL)
+                time.sleep(8 if not IS_CLOUD else 15)  # 雲端給更多渲染時間
 
-                # 等待 SPA 渲染完成：偵測「線上訂票」按鈕出現
-                print(">>> [秀泰] 等待頁面渲染...")
-                try:
-                    page.wait_for_function("""
-                        () => {
-                            const btns = document.querySelectorAll('div');
-                            for (const el of btns) {
-                                if (el.textContent.trim() === '線上訂票') return true;
-                            }
-                            return false;
-                        }
-                    """, timeout=20000)
-                    time.sleep(2)  # 額外等待確保所有電影卡片渲染完成
-                    print(">>> [秀泰] 頁面渲染完成")
-                except Exception:
-                    print(">>> [秀泰] 等待渲染超時，仍嘗試擷取...")
-                    time.sleep(5)
+                # 診斷：檢查頁面是否被 Cloudflare 擋住
+                page_text = page.evaluate(
+                    "() => (document.body ? document.body.innerText.substring(0, 300) : '')"
+                )
+                if any(kw in page_text for kw in [
+                    "Just a moment", "Checking your browser",
+                    "Enable JavaScript", "Attention Required",
+                ]):
+                    print(f">>> [秀泰] 偵測到 Cloudflare 驗證頁，等待挑戰解決...")
+                    time.sleep(10)  # 等待 Cloudflare 自動驗證
 
-                # 方法一（主要）：從 React fiber 擷取電影資料
-                # （秀泰官網現為 SSR + React SPA，capi API 已不再回傳電影清單）
-                print(">>> [秀泰] 從頁面 DOM / React fiber 擷取電影...")
-                try:
-                    raw_movies = page.evaluate("""
-                        () => {
-                            const results = [];
-                            const seen = new Set();
-                            const bookingBtns = Array.from(document.querySelectorAll('div')).filter(
-                                el => el.textContent.trim() === '線上訂票' &&
-                                      el.className && typeof el.className === 'string' &&
-                                      el.className.includes('sc-')
+                # 從 React fiber 擷取電影資料（與本機版完全相同）
+                raw_movies = page.evaluate("""
+                    () => {
+                        const results = [];
+                        const seen = new Set();
+                        const bookingBtns = Array.from(document.querySelectorAll('div')).filter(
+                            el => el.textContent.trim() === '線上訂票' &&
+                                  el.className && typeof el.className === 'string' &&
+                                  el.className.includes('sc-')
+                        );
+
+                        for (const btn of bookingBtns) {
+                            const fiberKey = Object.keys(btn).find(
+                                k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
                             );
+                            if (!fiberKey) continue;
 
-                            for (const btn of bookingBtns) {
-                                const fiberKey = Object.keys(btn).find(
-                                    k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
-                                );
-                                if (!fiberKey) continue;
-
-                                let fiber = btn[fiberKey];
-                                for (let i = 0; i < 25 && fiber; i++) {
-                                    if (fiber.memoizedProps && fiber.memoizedProps.program) {
-                                        const prog = fiber.memoizedProps.program;
-                                        const key = prog.id + '_' + prog.name;
-                                        if (!seen.has(key)) {
-                                            seen.add(key);
-                                            results.push({
-                                                id: prog.id,
-                                                name: prog.name || '',
-                                                type: prog.type || '',
-                                                rating: prog.rating || ''
-                                            });
-                                        }
-                                        break;
+                            let fiber = btn[fiberKey];
+                            for (let i = 0; i < 25 && fiber; i++) {
+                                if (fiber.memoizedProps && fiber.memoizedProps.program) {
+                                    const prog = fiber.memoizedProps.program;
+                                    const key = prog.id + '_' + prog.name;
+                                    if (!seen.has(key)) {
+                                        seen.add(key);
+                                        results.push({
+                                            id: prog.id,
+                                            name: prog.name || '',
+                                            type: prog.type || '',
+                                            rating: prog.rating || ''
+                                        });
                                     }
-                                    fiber = fiber.return;
+                                    break;
                                 }
+                                fiber = fiber.return;
                             }
-                            return results;
                         }
-                    """)
+                        return results;
+                    }
+                """)
 
-                    seen_names = set()
-                    for movie in raw_movies:
-                        name = movie.get("name", "")
-                        pid = movie.get("id")
-                        if name and pid and name not in seen_names:
-                            movies[name] = pid
-                            seen_names.add(name)
-                    print(f">>> [秀泰] 從 DOM 取得 {len(movies)} 部電影")
-                except Exception as e:
-                    print(f">>> [秀泰] DOM 擷取失敗: {e}")
+                seen_names = set()
+                for movie in raw_movies:
+                    name = movie.get("name", "")
+                    pid = movie.get("id")
+                    if name and pid and name not in seen_names:
+                        movies[name] = pid
+                        seen_names.add(name)
 
-                # 方法二（備用）：直接呼叫 API（加上 timeout 保護）
-                if not movies:
-                    print(">>> [秀泰] DOM 方法未取得資料，嘗試 API 備用方案...")
-                    try:
-                        api_data = page.evaluate("""
-                            async () => {
-                                const controller = new AbortController();
-                                const timeoutId = setTimeout(() => controller.abort(), 10000);
-                                try {
-                                    const resp = await fetch(
-                                        'https://capi.showtimes.com.tw/1/programs',
-                                        { signal: controller.signal }
-                                    );
-                                    clearTimeout(timeoutId);
-                                    return await resp.json();
-                                } catch(e) {
-                                    clearTimeout(timeoutId);
-                                    return {error: e.toString()};
-                                }
-                            }
-                        """)
-                        if isinstance(api_data, dict) and "error" not in api_data:
-                            progs = api_data.get("payload", {}).get("programs", [])
-                            seen_names = set()
-                            for prog in progs:
-                                name = prog.get("name", "")
-                                pid = prog.get("id")
-                                if name and pid and name not in seen_names:
-                                    movies[name] = pid
-                                    seen_names.add(name)
-                            print(f">>> [秀泰] 從 API 取得 {len(movies)} 部電影")
-                        else:
-                            err = api_data.get("error", "unknown") if isinstance(api_data, dict) else str(api_data)
-                            print(f">>> [秀泰] API 呼叫失敗: {err}")
-                    except Exception as e:
-                        print(f">>> [秀泰] API 備用方案失敗: {e}")
+                print(f">>> [秀泰] 瀏覽器方式取得 {len(movies)} 部電影")
 
                 # 取得影城列表
                 if movies:
                     first_id = list(movies.values())[0]
-                    page.goto(
-                        self.BOOKING_URL_TEMPLATE.format(first_id),
-                        timeout=60000,
-                        wait_until="domcontentloaded",
-                    )
-                    try:
-                        page.wait_for_function("""
-                            () => {
-                                const btns = Array.from(document.querySelectorAll('button'));
-                                return btns.some(b => b.textContent.includes('秀泰影城'));
-                            }
-                        """, timeout=15000)
-                        time.sleep(1)
-                    except Exception:
-                        time.sleep(5)
+                    self._goto_safe(page, self.BOOKING_URL_TEMPLATE.format(first_id))
+                    time.sleep(5 if not IS_CLOUD else 8)
 
                     raw_cinemas = page.evaluate("""
                         () => {
@@ -525,9 +583,20 @@ class ShowtimeBot:
                     print(f">>> [秀泰] 取得 {len(cinemas)} 間影城")
 
             except Exception as e:
-                print(f"[Error] ShowtimeBot.get_movies_and_cinemas: {e}")
+                print(f"[Error] ShowtimeBot.get_movies_and_cinemas (browser): {e}")
             finally:
                 browser.close()
+
+        # ============================================================
+        # 方法二（雲端備援）：純 Python HTTP 直接呼叫 API
+        # 繞過 Cloudflare 的瀏覽器層封鎖
+        # ============================================================
+        if not movies and IS_CLOUD:
+            print(">>> [秀泰] 瀏覽器方式失敗，嘗試 HTTP API 備援...")
+            movies = _fetch_showtime_programs_via_http()
+            if movies:
+                first_id = list(movies.values())[0]
+                cinemas = _fetch_showtime_cinemas_via_http(first_id)
 
         return movies, cinemas
 
@@ -560,45 +629,73 @@ class ShowtimeBot:
 
                 page.on("response", on_response)
 
-                page.goto(
-                    self.BOOKING_URL_TEMPLATE.format(program_id),
-                    timeout=60000,
-                    wait_until="domcontentloaded",
-                )
-                time.sleep(3)
+                self._goto_safe(page, self.BOOKING_URL_TEMPLATE.format(program_id))
+                time.sleep(3 if not IS_CLOUD else 6)
 
                 target_cinema = selected_cinemas[0]
                 cinema_btn = page.locator(f"button:has-text('{target_cinema}')")
                 if cinema_btn.count() > 0:
                     cinema_btn.first.click()
                     print(f">>> [秀泰] 已點選 {target_cinema}")
-                    time.sleep(5)
+                    time.sleep(5 if not IS_CLOUD else 8)
                 else:
                     print(f">>> [秀泰] 找不到 {target_cinema} 按鈕")
 
                 if not captured_events:
                     print(">>> [秀泰] 攔截未取得資料，嘗試直接呼叫 API...")
                     today_str = date.today().isoformat()
-                    events_data = page.evaluate(
-                        """async (args) => {
-                            try {
-                                const resp = await fetch(
-                                    'https://capi.showtimes.com.tw/1/events/listForProgram/'
-                                    + args.pid + '?date=' + args.today + '&forVista=false'
-                                );
-                                return await resp.json();
-                            } catch(e) {
-                                return {error: e.toString()};
-                            }
-                        }""",
-                        {"pid": str(program_id), "today": today_str},
-                    )
-                    if "error" not in events_data:
-                        captured_events = (
-                            events_data.get("payload", {}).get("events", [])
+                    try:
+                        events_data = page.evaluate(
+                            """async (args) => {
+                                const controller = new AbortController();
+                                const tid = setTimeout(() => controller.abort(), 15000);
+                                try {
+                                    const resp = await fetch(
+                                        'https://capi.showtimes.com.tw/1/events/listForProgram/'
+                                        + args.pid + '?date=' + args.today + '&forVista=false',
+                                        { signal: controller.signal }
+                                    );
+                                    clearTimeout(tid);
+                                    return await resp.json();
+                                } catch(e) {
+                                    clearTimeout(tid);
+                                    return {error: e.toString()};
+                                }
+                            }""",
+                            {"pid": str(program_id), "today": today_str},
                         )
-                    else:
-                        print(f">>> [秀泰] API 呼叫失敗: {events_data['error']}")
+                        if isinstance(events_data, dict) and "error" not in events_data:
+                            captured_events = (
+                                events_data.get("payload", {}).get("events", [])
+                            )
+                        else:
+                            err = events_data.get("error", "unknown") if isinstance(events_data, dict) else str(events_data)
+                            print(f">>> [秀泰] 瀏覽器 API 呼叫失敗: {err}")
+                    except Exception as e:
+                        print(f">>> [秀泰] 瀏覽器 API 例外: {e}")
+
+                # 雲端備援：用 Python HTTP 直接呼叫 events API
+                if not captured_events and IS_CLOUD:
+                    print(">>> [秀泰] 嘗試 HTTP API 取得場次...")
+                    try:
+                        today_str = date.today().isoformat()
+                        api_url = (
+                            f"https://capi.showtimes.com.tw/1/events/listForProgram/"
+                            f"{program_id}?date={today_str}&forVista=false"
+                        )
+                        http_headers = {
+                            "User-Agent": self.USER_AGENT,
+                            "Accept": "application/json, text/plain, */*",
+                            "Origin": "https://www.showtimes.com.tw",
+                            "Referer": "https://www.showtimes.com.tw/",
+                        }
+                        req = urllib.request.Request(api_url, headers=http_headers)
+                        with urllib.request.urlopen(req, timeout=15) as resp:
+                            edata = json.loads(resp.read().decode("utf-8"))
+                            captured_events = edata.get("payload", {}).get("events", [])
+                            print(f">>> [秀泰] HTTP API 取得 {len(captured_events)} 筆場次")
+                    except Exception as e:
+                        print(f">>> [秀泰] HTTP API 場次失敗: {e}")
 
                 if not captured_events:
                     print(">>> [秀泰] 此電影目前無場次資料")
@@ -613,28 +710,56 @@ class ShowtimeBot:
                 if missing_ids:
                     ids_str = ",".join(str(vid) for vid in missing_ids)
                     print(f">>> [秀泰] 取得 {len(missing_ids)} 間影城的名稱資訊...")
+                    # 先嘗試瀏覽器內 fetch，失敗則用 HTTP
                     try:
                         extra = page.evaluate(
                             """async (idsStr) => {
+                                const controller = new AbortController();
+                                const tid = setTimeout(() => controller.abort(), 10000);
                                 try {
                                     const resp = await fetch(
-                                        'https://capi.showtimes.com.tw/1/venues/ids/' + idsStr
+                                        'https://capi.showtimes.com.tw/1/venues/ids/' + idsStr,
+                                        { signal: controller.signal }
                                     );
+                                    clearTimeout(tid);
                                     return await resp.json();
                                 } catch(e) {
+                                    clearTimeout(tid);
                                     return {error: e.toString()};
                                 }
                             }""",
                             ids_str,
                         )
-                        if "error" not in extra:
+                        if isinstance(extra, dict) and "error" not in extra:
                             for v in extra.get("payload", {}).get("venues", []):
                                 captured_venues[v["id"]] = {
                                     "name": v.get("name", ""),
                                     "room": v.get("room", ""),
                                 }
-                    except Exception as e:
-                        print(f">>> [秀泰] 取得影城名稱失敗: {e}")
+                    except Exception:
+                        pass
+
+                    # HTTP 備援
+                    still_missing = event_venue_ids - set(captured_venues.keys())
+                    if still_missing:
+                        try:
+                            ids_str2 = ",".join(str(vid) for vid in still_missing)
+                            venue_url = f"https://capi.showtimes.com.tw/1/venues/ids/{ids_str2}"
+                            req = urllib.request.Request(venue_url, headers={
+                                "User-Agent": self.USER_AGENT,
+                                "Accept": "application/json",
+                                "Origin": "https://www.showtimes.com.tw",
+                                "Referer": "https://www.showtimes.com.tw/",
+                            })
+                            with urllib.request.urlopen(req, timeout=15) as resp:
+                                vdata = json.loads(resp.read().decode("utf-8"))
+                                for v in vdata.get("payload", {}).get("venues", []):
+                                    captured_venues[v["id"]] = {
+                                        "name": v.get("name", ""),
+                                        "room": v.get("room", ""),
+                                    }
+                        except Exception as e:
+                            print(f">>> [秀泰] HTTP 取得影城名稱失敗: {e}")
 
                 def match_cinema(api_name, selected_list):
                     for sel in selected_list:
