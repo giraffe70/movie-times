@@ -9,6 +9,7 @@ import urllib.error
 from datetime import date, datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from playwright_stealth import Stealth
 
 # --- 自動安裝 Playwright 瀏覽器 (針對雲端環境) ---
 import os
@@ -117,13 +118,6 @@ class VieshowBot:
         "Chrome/131.0.0.0 Safari/537.36"
     )
 
-    STEALTH_SCRIPT = """
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['zh-TW', 'zh', 'en-US', 'en'] });
-    """
-
     def __init__(self):
         self.url = "https://www.vscinemas.com.tw/ShowTimes/"
 
@@ -156,19 +150,19 @@ class VieshowBot:
             )
             print(">>> [威秀] 使用隱藏視窗模式")
 
+        # playwright-stealth 已自動注入反偵測腳本，不需手動 add_init_script
         page = browser.new_page(
             user_agent=self.USER_AGENT,
             viewport={"width": 1920, "height": 1080},
             locale="zh-TW",
         )
-        page.add_init_script(self.STEALTH_SCRIPT)
         return browser, page
 
     def get_cinemas_and_movies(self):
         cinema_options = {}
         movie_list = []
 
-        with sync_playwright() as p:
+        with Stealth().use_sync(sync_playwright()) as p:
             browser, page = self._create_stealth_page(p)
             try:
                 page.goto(self.url, timeout=60000)
@@ -225,7 +219,7 @@ class VieshowBot:
     def get_movie_times_for_cinemas(self, cinema_dict, target_movie):
         results = {}
 
-        with sync_playwright() as p:
+        with Stealth().use_sync(sync_playwright()) as p:
             print(f">>> [威秀] 啟動爬蟲，查詢《{target_movie}》於 {len(cinema_dict)} 間影城")
             browser, page = self._create_stealth_page(p)
 
@@ -401,24 +395,6 @@ class ShowtimeBot:
         "Chrome/131.0.0.0 Safari/537.36"
     )
 
-    # 加強版反偵測腳本（針對 Cloudflare Turnstile）
-    STEALTH_SCRIPT = """
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['zh-TW', 'zh', 'en-US', 'en'] });
-        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-        if (navigator.permissions && navigator.permissions.query) {
-            const origQuery = navigator.permissions.query.bind(navigator.permissions);
-            navigator.permissions.query = (params) =>
-                params.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : origQuery(params);
-        }
-    """
-
     PROGRAMS_URL = "https://www.showtimes.com.tw/programs"
     BOOKING_URL_TEMPLATE = "https://www.showtimes.com.tw/ticketing/forProgram/{}"
 
@@ -440,19 +416,22 @@ class ShowtimeBot:
             except Exception as e:
                 print(f">>> [秀泰] Edge 不可用 ({e})")
 
-        # 2. 雲端: 使用 Chromium headless（新版 headless 與完整瀏覽器同核心，
-        #    比 headless=False + Xvfb 更穩定、更省資源、反偵測能力也不差）
+        # 2. 雲端: 使用 headless=False + Xvfb（與威秀相同策略）
+        #    完整 GUI 瀏覽器更不容易被 Cloudflare Turnstile 偵測
         if browser is None and IS_CLOUD:
             try:
                 browser = playwright_instance.chromium.launch(
-                    headless=True,
-                    args=launch_args,
+                    headless=False,
+                    args=launch_args + [
+                        "--window-position=-32000,-32000",
+                        "--window-size=1,1",
+                    ],
                 )
-                print(">>> [秀泰] 使用 Chromium headless 模式 (雲端)")
+                print(">>> [秀泰] 使用隱藏視窗模式 (雲端 Xvfb)")
             except Exception as e:
-                print(f">>> [秀泰] Chromium headless 失敗: {e}")
+                print(f">>> [秀泰] 雲端隱藏視窗模式失敗: {e}")
 
-        # 3. 備用：headless=False 隱藏視窗模式
+        # 3. 備用：headless=False 隱藏視窗模式（本機 fallback）
         if browser is None:
             browser = playwright_instance.chromium.launch(
                 headless=False,
@@ -463,12 +442,12 @@ class ShowtimeBot:
             )
             print(">>> [秀泰] 使用隱藏視窗模式 (fallback)")
 
+        # playwright-stealth 已自動注入反偵測腳本，不需手動 add_init_script
         page = browser.new_page(
             user_agent=self.USER_AGENT,
             viewport={"width": 1920, "height": 1080},
             locale="zh-TW",
         )
-        page.add_init_script(self.STEALTH_SCRIPT)
         return browser, page
 
     def _goto_safe(self, page, url, timeout=60000):
@@ -486,6 +465,36 @@ class ShowtimeBot:
             else:
                 raise
 
+    def _wait_for_cloudflare(self, page, label=""):
+        """
+        輪詢等待 Cloudflare Turnstile 挑戰自動通過。
+        最多等待 35 秒（7 次 × 5 秒），若通過則提前結束。
+        """
+        CF_KEYWORDS = [
+            "Just a moment", "Checking your browser",
+            "Enable JavaScript", "Attention Required",
+        ]
+        page_text = page.evaluate(
+            "() => (document.body ? document.body.innerText.substring(0, 500) : '')"
+        )
+        if not any(kw in page_text for kw in CF_KEYWORDS):
+            return True  # 沒有 Cloudflare 擋住
+
+        print(f">>> [秀泰]{label} 偵測到 Cloudflare 驗證頁，等待挑戰自動解決...")
+        for attempt in range(7):  # 最多等 35 秒 (7 x 5秒)
+            time.sleep(5)
+            check_text = page.evaluate(
+                "() => (document.body ? document.body.innerText.substring(0, 500) : '')"
+            )
+            if not any(kw in check_text for kw in CF_KEYWORDS):
+                print(f">>> [秀泰]{label} Cloudflare 驗證已通過（等待了 {(attempt+1)*5} 秒）")
+                time.sleep(3)  # 通過後再多等一下讓頁面渲染
+                return True
+            print(f">>> [秀泰]{label} 仍在等待 Cloudflare 驗證... ({(attempt+1)*5}秒)")
+
+        print(f">>> [秀泰]{label} Cloudflare 驗證未能在 35 秒內通過")
+        return False
+
     def get_movies_and_cinemas(self):
         movies = {}
         cinemas = []
@@ -493,23 +502,15 @@ class ShowtimeBot:
         # ============================================================
         # 方法一：瀏覽器渲染 + React fiber 擷取（本機版相同邏輯）
         # ============================================================
-        with sync_playwright() as p:
+        with Stealth().use_sync(sync_playwright()) as p:
             browser, page = self._create_stealth_page(p)
             try:
                 print(">>> [秀泰] 正在讀取電影清單...")
                 self._goto_safe(page, self.PROGRAMS_URL)
                 time.sleep(8 if not IS_CLOUD else 15)  # 雲端給更多渲染時間
 
-                # 診斷：檢查頁面是否被 Cloudflare 擋住
-                page_text = page.evaluate(
-                    "() => (document.body ? document.body.innerText.substring(0, 300) : '')"
-                )
-                if any(kw in page_text for kw in [
-                    "Just a moment", "Checking your browser",
-                    "Enable JavaScript", "Attention Required",
-                ]):
-                    print(f">>> [秀泰] 偵測到 Cloudflare 驗證頁，等待挑戰解決...")
-                    time.sleep(10)  # 等待 Cloudflare 自動驗證
+                # 診斷：檢查頁面是否被 Cloudflare 擋住，輪詢等待最多 35 秒
+                self._wait_for_cloudflare(page, " (電影清單)")
 
                 # 從 React fiber 擷取電影資料（與本機版完全相同）
                 raw_movies = page.evaluate("""
@@ -605,7 +606,7 @@ class ShowtimeBot:
         captured_events = []
         captured_venues = {}
 
-        with sync_playwright() as p:
+        with Stealth().use_sync(sync_playwright()) as p:
             print(f">>> [秀泰] 啟動爬蟲，查詢 programId={program_id}")
             browser, page = self._create_stealth_page(p)
 
@@ -631,6 +632,9 @@ class ShowtimeBot:
 
                 self._goto_safe(page, self.BOOKING_URL_TEMPLATE.format(program_id))
                 time.sleep(3 if not IS_CLOUD else 6)
+
+                # 等待 Cloudflare 驗證通過
+                self._wait_for_cloudflare(page, " (場次查詢)")
 
                 target_cinema = selected_cinemas[0]
                 cinema_btn = page.locator(f"button:has-text('{target_cinema}')")
