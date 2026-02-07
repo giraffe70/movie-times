@@ -4,8 +4,7 @@ import sys
 import re
 import time
 import json
-import urllib.request
-import urllib.error
+from curl_cffi import requests as cffi_requests
 from datetime import date, datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -312,80 +311,175 @@ class VieshowBot:
 # 4B. 秀泰影城爬蟲機器人
 # ====================================================================
 
+# --- 秀泰 HTTP API 工具函式 (使用 curl_cffi 模擬 Chrome TLS 指紋) ---
+
+_SHOWTIME_API_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Origin": "https://www.showtimes.com.tw",
+    "Referer": "https://www.showtimes.com.tw/",
+}
+
+
+def _showtime_api_get(url):
+    """用 curl_cffi 發送 GET，模擬 Chrome 131 TLS 指紋以繞過 Cloudflare。"""
+    resp = cffi_requests.get(
+        url,
+        headers=_SHOWTIME_API_HEADERS,
+        impersonate="chrome131",
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def _fetch_showtime_programs_via_http():
-    """
-    純 Python HTTP 備援：不透過瀏覽器，直接用 urllib 向秀泰 API 取得電影清單。
-    在 Streamlit Cloud 上若瀏覽器被 Cloudflare 擋住，此方法可繞過。
-    """
-    url = "https://capi.showtimes.com.tw/1/programs"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Origin": "https://www.showtimes.com.tw",
-        "Referer": "https://www.showtimes.com.tw/programs",
-    }
+    """HTTP API: 取得秀泰電影清單"""
     movies = {}
     try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            progs = data.get("payload", {}).get("programs", [])
-            seen = set()
-            for prog in progs:
-                name = prog.get("name", "")
-                pid = prog.get("id")
-                if name and pid and name not in seen:
-                    movies[name] = pid
-                    seen.add(name)
-            print(f">>> [秀泰] HTTP API 取得 {len(movies)} 部電影")
+        data = _showtime_api_get("https://capi.showtimes.com.tw/1/programs")
+        progs = data.get("payload", {}).get("programs", [])
+        seen = set()
+        for prog in progs:
+            name = prog.get("name", "")
+            pid = prog.get("id")
+            if name and pid and name not in seen:
+                movies[name] = pid
+                seen.add(name)
+        print(f">>> [秀泰] HTTP API (curl_cffi) 取得 {len(movies)} 部電影")
     except Exception as e:
-        print(f">>> [秀泰] HTTP API 失敗: {e}")
+        print(f">>> [秀泰] HTTP API 電影清單失敗: {e}")
     return movies
 
 
 def _fetch_showtime_cinemas_via_http(program_id):
-    """純 Python HTTP 備援：取得影城列表"""
-    today_str = date.today().isoformat()
-    url = (
-        f"https://capi.showtimes.com.tw/1/events/listForProgram/"
-        f"{program_id}?date={today_str}&forVista=false"
-    )
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://www.showtimes.com.tw",
-        "Referer": "https://www.showtimes.com.tw/",
-    }
+    """HTTP API: 取得有此電影場次的秀泰影城列表"""
     cinemas = []
     try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            events = data.get("payload", {}).get("events", [])
-            venue_ids = list(set(str(e.get("venueId", "")) for e in events if e.get("venueId")))
-            if venue_ids:
-                ids_str = ",".join(venue_ids)
-                venue_url = f"https://capi.showtimes.com.tw/1/venues/ids/{ids_str}"
-                req2 = urllib.request.Request(venue_url, headers=headers)
-                with urllib.request.urlopen(req2, timeout=15) as resp2:
-                    vdata = json.loads(resp2.read().decode("utf-8"))
-                    for v in vdata.get("payload", {}).get("venues", []):
-                        name = v.get("name", "")
-                        if "秀泰影城" in name and name not in cinemas:
-                            cinemas.append(name)
-            print(f">>> [秀泰] HTTP API 取得 {len(cinemas)} 間影城")
+        today_str = date.today().isoformat()
+        url = (
+            f"https://capi.showtimes.com.tw/1/events/listForProgram/"
+            f"{program_id}?date={today_str}&forVista=false"
+        )
+        data = _showtime_api_get(url)
+        events = data.get("payload", {}).get("events", [])
+        venue_ids = list(set(
+            str(e.get("venueId", "")) for e in events if e.get("venueId")
+        ))
+        if venue_ids:
+            ids_str = ",".join(venue_ids)
+            vdata = _showtime_api_get(
+                f"https://capi.showtimes.com.tw/1/venues/ids/{ids_str}"
+            )
+            for v in vdata.get("payload", {}).get("venues", []):
+                name = v.get("name", "")
+                if "秀泰影城" in name and name not in cinemas:
+                    cinemas.append(name)
+        print(f">>> [秀泰] HTTP API (curl_cffi) 取得 {len(cinemas)} 間影城")
     except Exception as e:
-        print(f">>> [秀泰] HTTP 取得影城失敗: {e}")
+        print(f">>> [秀泰] HTTP API 影城列表失敗: {e}")
     return cinemas
+
+
+def _fetch_showtime_events_via_http(program_id):
+    """HTTP API: 取得場次資料"""
+    try:
+        today_str = date.today().isoformat()
+        url = (
+            f"https://capi.showtimes.com.tw/1/events/listForProgram/"
+            f"{program_id}?date={today_str}&forVista=false"
+        )
+        data = _showtime_api_get(url)
+        events = data.get("payload", {}).get("events", [])
+        print(f">>> [秀泰] HTTP API (curl_cffi) 取得 {len(events)} 筆場次")
+        return events
+    except Exception as e:
+        print(f">>> [秀泰] HTTP API 場次失敗: {e}")
+        return []
+
+
+def _fetch_showtime_venues_via_http(venue_ids):
+    """HTTP API: 取得影城詳細資訊"""
+    venues = {}
+    if not venue_ids:
+        return venues
+    try:
+        ids_str = ",".join(str(vid) for vid in venue_ids)
+        vdata = _showtime_api_get(
+            f"https://capi.showtimes.com.tw/1/venues/ids/{ids_str}"
+        )
+        for v in vdata.get("payload", {}).get("venues", []):
+            venues[v["id"]] = {
+                "name": v.get("name", ""),
+                "room": v.get("room", ""),
+            }
+        print(f">>> [秀泰] HTTP API (curl_cffi) 取得 {len(venues)} 間影城資訊")
+    except Exception as e:
+        print(f">>> [秀泰] HTTP API 影城資訊失敗: {e}")
+    return venues
+
+
+def _process_showtime_events(captured_events, captured_venues, selected_cinemas):
+    """
+    將場次原始資料處理成最終顯示結果。
+    (從 ShowtimeBot.get_movie_times 提取出來的共用邏輯)
+    """
+    results = {}
+
+    def match_cinema(api_name, selected_list):
+        for sel in selected_list:
+            if sel in api_name or api_name in sel:
+                return sel
+        return None
+
+    for event in captured_events:
+        venue_id = event.get("venueId")
+        venue_info = captured_venues.get(venue_id, {})
+        cinema_name = venue_info.get("name", f"未知影城({venue_id})")
+
+        matched = match_cinema(cinema_name, selected_cinemas)
+        if matched is None:
+            continue
+
+        started_at = event.get("startedAt", "")
+        if not started_at:
+            continue
+
+        dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        dt_local = dt.astimezone(TW_TZ)
+
+        date_str = format_date_with_weekday(dt_local)
+        time_str = dt_local.strftime("%H:%M")
+        format_info = event.get("meta", {}).get("format", "")
+
+        display_name = matched
+
+        if display_name not in results:
+            results[display_name] = {}
+        if date_str not in results[display_name]:
+            results[display_name][date_str] = []
+
+        display = time_str
+        if format_info:
+            display = f"{time_str} [{format_info}]"
+        results[display_name][date_str].append(display)
+
+    for cinema in results:
+        sorted_dates = sorted(
+            results[cinema].keys(),
+            key=lambda d: parse_date_from_string(d) or date.max,
+        )
+        results[cinema] = {
+            d: sorted(list(set(results[cinema][d])))
+            for d in sorted_dates
+        }
+
+    total_dates = sum(len(dm) for dm in results.values())
+    print(
+        f">>> [秀泰] 處理完成，"
+        f"找到 {len(results)} 間影城、共 {total_dates} 天場次。"
+    )
+    return results
 
 
 class ShowtimeBot:
@@ -500,19 +594,34 @@ class ShowtimeBot:
         cinemas = []
 
         # ============================================================
-        # 方法一：瀏覽器渲染 + React fiber 擷取（本機版相同邏輯）
+        # 雲端：優先使用 curl_cffi HTTP API（繞過 Cloudflare TLS 偵測）
+        # ============================================================
+        if IS_CLOUD:
+            print(">>> [秀泰] 雲端環境，優先使用 HTTP API (curl_cffi)...")
+            movies = _fetch_showtime_programs_via_http()
+            if movies:
+                first_id = list(movies.values())[0]
+                cinemas = _fetch_showtime_cinemas_via_http(first_id)
+            if movies and cinemas:
+                return movies, cinemas
+            print(">>> [秀泰] HTTP API 未取得完整資料，嘗試瀏覽器方式...")
+            movies = {}
+            cinemas = []
+
+        # ============================================================
+        # 本機 或 雲端 HTTP 失敗：瀏覽器渲染 + React fiber 擷取
         # ============================================================
         with Stealth().use_sync(sync_playwright()) as p:
             browser, page = self._create_stealth_page(p)
             try:
-                print(">>> [秀泰] 正在讀取電影清單...")
+                print(">>> [秀泰] 正在讀取電影清單 (瀏覽器)...")
                 self._goto_safe(page, self.PROGRAMS_URL)
-                time.sleep(8 if not IS_CLOUD else 15)  # 雲端給更多渲染時間
+                time.sleep(8 if not IS_CLOUD else 15)
 
-                # 診斷：檢查頁面是否被 Cloudflare 擋住，輪詢等待最多 35 秒
+                # 檢查頁面是否被 Cloudflare 擋住，輪詢等待最多 35 秒
                 self._wait_for_cloudflare(page, " (電影清單)")
 
-                # 從 React fiber 擷取電影資料（與本機版完全相同）
+                # 從 React fiber 擷取電影資料
                 raw_movies = page.evaluate("""
                     () => {
                         const results = [];
@@ -589,10 +698,9 @@ class ShowtimeBot:
                 browser.close()
 
         # ============================================================
-        # 方法二（雲端備援）：純 Python HTTP 直接呼叫 API
-        # 繞過 Cloudflare 的瀏覽器層封鎖
+        # 最終備援：瀏覽器也失敗時嘗試 curl_cffi HTTP API
         # ============================================================
-        if not movies and IS_CLOUD:
+        if not movies:
             print(">>> [秀泰] 瀏覽器方式失敗，嘗試 HTTP API 備援...")
             movies = _fetch_showtime_programs_via_http()
             if movies:
@@ -602,6 +710,27 @@ class ShowtimeBot:
         return movies, cinemas
 
     def get_movie_times(self, program_id, selected_cinemas):
+        # ============================================================
+        # 雲端：優先使用 curl_cffi HTTP API（快速、繞過 Cloudflare）
+        # ============================================================
+        if IS_CLOUD:
+            print(f">>> [秀泰] 雲端環境，使用 HTTP API 查詢 programId={program_id}")
+            events = _fetch_showtime_events_via_http(program_id)
+            if events:
+                venue_ids = list(set(
+                    e.get("venueId") for e in events if e.get("venueId")
+                ))
+                venues = _fetch_showtime_venues_via_http(venue_ids)
+                results = _process_showtime_events(
+                    events, venues, selected_cinemas
+                )
+                if results:
+                    return results
+            print(">>> [秀泰] HTTP API 未取得有效場次，嘗試瀏覽器方式...")
+
+        # ============================================================
+        # 本機 或 雲端 HTTP 失敗：使用瀏覽器
+        # ============================================================
         results = {}
         captured_events = []
         captured_venues = {}
@@ -645,8 +774,9 @@ class ShowtimeBot:
                 else:
                     print(f">>> [秀泰] 找不到 {target_cinema} 按鈕")
 
+                # 攔截未取得資料時，嘗試在瀏覽器內呼叫 API
                 if not captured_events:
-                    print(">>> [秀泰] 攔截未取得資料，嘗試直接呼叫 API...")
+                    print(">>> [秀泰] 攔截未取得資料，嘗試瀏覽器內 API 呼叫...")
                     today_str = date.today().isoformat()
                     try:
                         events_data = page.evaluate(
@@ -678,28 +808,10 @@ class ShowtimeBot:
                     except Exception as e:
                         print(f">>> [秀泰] 瀏覽器 API 例外: {e}")
 
-                # 雲端備援：用 Python HTTP 直接呼叫 events API
-                if not captured_events and IS_CLOUD:
-                    print(">>> [秀泰] 嘗試 HTTP API 取得場次...")
-                    try:
-                        today_str = date.today().isoformat()
-                        api_url = (
-                            f"https://capi.showtimes.com.tw/1/events/listForProgram/"
-                            f"{program_id}?date={today_str}&forVista=false"
-                        )
-                        http_headers = {
-                            "User-Agent": self.USER_AGENT,
-                            "Accept": "application/json, text/plain, */*",
-                            "Origin": "https://www.showtimes.com.tw",
-                            "Referer": "https://www.showtimes.com.tw/",
-                        }
-                        req = urllib.request.Request(api_url, headers=http_headers)
-                        with urllib.request.urlopen(req, timeout=15) as resp:
-                            edata = json.loads(resp.read().decode("utf-8"))
-                            captured_events = edata.get("payload", {}).get("events", [])
-                            print(f">>> [秀泰] HTTP API 取得 {len(captured_events)} 筆場次")
-                    except Exception as e:
-                        print(f">>> [秀泰] HTTP API 場次失敗: {e}")
+                # 備援：用 curl_cffi HTTP API
+                if not captured_events:
+                    print(">>> [秀泰] 嘗試 curl_cffi HTTP API 取得場次...")
+                    captured_events = _fetch_showtime_events_via_http(program_id)
 
                 if not captured_events:
                     print(">>> [秀泰] 此電影目前無場次資料")
@@ -708,13 +820,14 @@ class ShowtimeBot:
 
                 print(f">>> [秀泰] 取得 {len(captured_events)} 筆場次")
 
+                # 補齊缺少的影城資訊
                 event_venue_ids = set(e["venueId"] for e in captured_events)
                 missing_ids = event_venue_ids - set(captured_venues.keys())
 
                 if missing_ids:
                     ids_str = ",".join(str(vid) for vid in missing_ids)
                     print(f">>> [秀泰] 取得 {len(missing_ids)} 間影城的名稱資訊...")
-                    # 先嘗試瀏覽器內 fetch，失敗則用 HTTP
+                    # 先嘗試瀏覽器內 fetch
                     try:
                         extra = page.evaluate(
                             """async (idsStr) => {
@@ -743,80 +856,17 @@ class ShowtimeBot:
                     except Exception:
                         pass
 
-                    # HTTP 備援
+                    # curl_cffi HTTP 備援
                     still_missing = event_venue_ids - set(captured_venues.keys())
                     if still_missing:
-                        try:
-                            ids_str2 = ",".join(str(vid) for vid in still_missing)
-                            venue_url = f"https://capi.showtimes.com.tw/1/venues/ids/{ids_str2}"
-                            req = urllib.request.Request(venue_url, headers={
-                                "User-Agent": self.USER_AGENT,
-                                "Accept": "application/json",
-                                "Origin": "https://www.showtimes.com.tw",
-                                "Referer": "https://www.showtimes.com.tw/",
-                            })
-                            with urllib.request.urlopen(req, timeout=15) as resp:
-                                vdata = json.loads(resp.read().decode("utf-8"))
-                                for v in vdata.get("payload", {}).get("venues", []):
-                                    captured_venues[v["id"]] = {
-                                        "name": v.get("name", ""),
-                                        "room": v.get("room", ""),
-                                    }
-                        except Exception as e:
-                            print(f">>> [秀泰] HTTP 取得影城名稱失敗: {e}")
+                        http_venues = _fetch_showtime_venues_via_http(
+                            list(still_missing)
+                        )
+                        captured_venues.update(http_venues)
 
-                def match_cinema(api_name, selected_list):
-                    for sel in selected_list:
-                        if sel in api_name or api_name in sel:
-                            return sel
-                    return None
-
-                for event in captured_events:
-                    venue_id = event.get("venueId")
-                    venue_info = captured_venues.get(venue_id, {})
-                    cinema_name = venue_info.get("name", f"未知影城({venue_id})")
-
-                    matched = match_cinema(cinema_name, selected_cinemas)
-                    if matched is None:
-                        continue
-
-                    started_at = event.get("startedAt", "")
-                    if not started_at:
-                        continue
-
-                    dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-                    dt_local = dt.astimezone(TW_TZ)
-
-                    date_str = format_date_with_weekday(dt_local)
-                    time_str = dt_local.strftime("%H:%M")
-                    format_info = event.get("meta", {}).get("format", "")
-
-                    display_name = matched
-
-                    if display_name not in results:
-                        results[display_name] = {}
-                    if date_str not in results[display_name]:
-                        results[display_name][date_str] = []
-
-                    display = time_str
-                    if format_info:
-                        display = f"{time_str} [{format_info}]"
-                    results[display_name][date_str].append(display)
-
-                for cinema in results:
-                    sorted_dates = sorted(
-                        results[cinema].keys(),
-                        key=lambda d: parse_date_from_string(d) or date.max,
-                    )
-                    results[cinema] = {
-                        d: sorted(list(set(results[cinema][d])))
-                        for d in sorted_dates
-                    }
-
-                total_dates = sum(len(dm) for dm in results.values())
-                print(
-                    f">>> [秀泰] 查詢完成，"
-                    f"找到 {len(results)} 間影城、共 {total_dates} 天場次。"
+                # 使用共用邏輯處理場次資料
+                results = _process_showtime_events(
+                    captured_events, captured_venues, selected_cinemas
                 )
 
             except Exception as e:
