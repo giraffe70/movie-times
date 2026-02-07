@@ -311,7 +311,7 @@ class VieshowBot:
 # 4B. 秀泰影城爬蟲機器人
 # ====================================================================
 
-# --- 秀泰 HTTP API 工具函式 (使用 curl_cffi 模擬 Chrome TLS 指紋) ---
+# --- 秀泰 HTTP API 工具函式 ---
 
 _SHOWTIME_API_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -320,15 +320,39 @@ _SHOWTIME_API_HEADERS = {
     "Referer": "https://www.showtimes.com.tw/",
 }
 
+# Cloudflare Worker 代理 URL（解決 Streamlit Cloud IP 被封鎖的問題）
+# 部署 Worker 後，在 Streamlit Cloud → App settings → Secrets 中設定：
+#   SHOWTIME_WORKER_URL = "https://showtime-proxy.<your-subdomain>.workers.dev"
+try:
+    SHOWTIME_WORKER_URL = st.secrets["SHOWTIME_WORKER_URL"]
+    print(f">>> [秀泰] Cloudflare Worker 代理已設定: {SHOWTIME_WORKER_URL}")
+except Exception:
+    SHOWTIME_WORKER_URL = ""
+
 
 def _showtime_api_get(url):
-    """用 curl_cffi 發送 GET，模擬 Chrome 131 TLS 指紋以繞過 Cloudflare。"""
-    resp = cffi_requests.get(
-        url,
-        headers=_SHOWTIME_API_HEADERS,
-        impersonate="chrome131",
-        timeout=15,
-    )
+    """
+    呼叫秀泰 API。
+    - 雲端且有 Worker URL：透過 Cloudflare Worker 代理（繞過 IP 封鎖）
+    - 本機或無 Worker：直接呼叫 + curl_cffi Chrome TLS 模擬
+    """
+    if IS_CLOUD and SHOWTIME_WORKER_URL:
+        # 透過 Cloudflare Worker 代理
+        # Worker 跑在 Cloudflare 邊緣網路，IP 信譽高，不會被 Cloudflare 自己擋
+        print(f">>> [秀泰] 透過 Worker 代理: {url}")
+        resp = cffi_requests.get(
+            SHOWTIME_WORKER_URL,
+            params={"target": url},
+            timeout=20,
+        )
+    else:
+        # 本機直接呼叫（本機 IP 不會被擋）
+        resp = cffi_requests.get(
+            url,
+            headers=_SHOWTIME_API_HEADERS,
+            impersonate="chrome131",
+            timeout=15,
+        )
     resp.raise_for_status()
     return resp.json()
 
