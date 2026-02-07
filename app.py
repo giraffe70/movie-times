@@ -361,7 +361,7 @@ def _fetch_showtime_programs_via_http():
     """HTTP API: 取得秀泰電影清單"""
     movies = {}
     try:
-        data = _showtime_api_get("https://capi.showtimes.com.tw/1/programs")
+        data = _showtime_api_get("https://capi.showtimes.com.tw/1/app/bootstrap?appVersion=2.9.200")
         progs = data.get("payload", {}).get("programs", [])
         seen = set()
         for prog in progs:
