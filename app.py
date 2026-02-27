@@ -156,7 +156,7 @@ st.divider()
 tab_vieshow, tab_showtime = st.tabs(["🍿 威秀影城", "🎬 秀泰影城"])
 
 # ----------------------------------------------------------------------
-# Tab 1: 威秀影城（延遲載入）
+# Tab 1: 威秀影城（自動載入）
 # ----------------------------------------------------------------------
 VIESHOW_OFFICIAL_URL = "https://www.vscinemas.com.tw/"
 SHOWTIME_OFFICIAL_URL = "https://www.showtimes.com.tw/programs"
@@ -165,17 +165,12 @@ with tab_vieshow:
     st.markdown(
         f"🌐 官方網站：[威秀影城]({VIESHOW_OFFICIAL_URL})"
     )
-    # 檢查 session_state 是否已有載入的資料
+    # 自動載入威秀影城資料
     if st.session_state.get("vs_data") is None:
-        if st.button(
-            "📥 載入威秀影城資料", key="load_vs", type="primary"
-        ):
-            with st.spinner("正在讀取威秀影城與電影清單..."):
-                vs_data = cached_vieshow_get_cinemas_and_movies()
-            st.session_state["vs_data"] = vs_data
-            st.rerun()
-        else:
-            st.info("💡 點擊上方按鈕載入威秀影城的電影與場次資料。")
+        with st.spinner("正在讀取威秀影城與電影清單..."):
+            vs_data = cached_vieshow_get_cinemas_and_movies()
+        st.session_state["vs_data"] = vs_data
+        st.rerun()
     else:
         vs_cinema_map, vs_movie_list = st.session_state["vs_data"]
 
@@ -255,23 +250,18 @@ with tab_vieshow:
 
 
 # ----------------------------------------------------------------------
-# Tab 2: 秀泰影城（延遲載入）
+# Tab 2: 秀泰影城（自動載入）
 # ----------------------------------------------------------------------
 with tab_showtime:
     st.markdown(
         f"🌐 官方網站：[秀泰影城]({SHOWTIME_OFFICIAL_URL})"
     )
-    # 檢查 session_state 是否已有載入的資料
+    # 自動載入秀泰影城資料
     if st.session_state.get("st_data") is None:
-        if st.button(
-            "📥 載入秀泰影城資料", key="load_st", type="primary"
-        ):
-            with st.spinner("正在讀取秀泰電影與影城清單..."):
-                st_data = cached_showtime_get_movies_and_cinemas()
-            st.session_state["st_data"] = st_data
-            st.rerun()
-        else:
-            st.info("💡 點擊上方按鈕載入秀泰影城的電影與場次資料。")
+        with st.spinner("正在讀取秀泰電影與影城清單..."):
+            st_data = cached_showtime_get_movies_and_cinemas()
+        st.session_state["st_data"] = st_data
+        st.rerun()
     else:
         st_movies_map, st_cinema_list = st.session_state["st_data"]
 
